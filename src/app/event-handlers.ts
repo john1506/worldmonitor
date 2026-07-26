@@ -1864,7 +1864,6 @@ export class EventHandlerManager implements AppModule {
   }
 
   setupPlaybackControl(): void {
-    // Always create — show/hide reactively via auth state subscription below.
     this.ctx.playbackControl = new PlaybackControl();
     this.ctx.playbackControl.onSnapshot((snapshot) => {
       if (snapshot) {
@@ -1881,13 +1880,6 @@ export class EventHandlerManager implements AppModule {
     if (headerRight) {
       headerRight.insertBefore(el, headerRight.firstChild);
     }
-
-    const applyProGate = (isPro: boolean, initial = false) => {
-      el.style.display = isPro ? '' : 'none';
-      if (initial && !isPro) trackGateHit('playback');
-    };
-    applyProGate(getAuthState().user?.role === 'pro', true);
-    this.proGateUnsubscribers.push(subscribeAuthState(state => applyProGate(state.user?.role === 'pro')));
   }
 
   setupSnapshotSaving(): void {
