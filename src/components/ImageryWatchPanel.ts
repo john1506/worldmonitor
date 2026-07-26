@@ -54,6 +54,21 @@ function bboxFromCenter(lat: number, lon: number, radiusKm: number): [number, nu
   return [lon - dLon, lat - dLat, lon + dLon, lat + dLat];
 }
 
+// Accepts whatever people actually paste: "50.4501, 30.5234" (Google Maps'
+// own copy-coordinates format), "50.4501 30.5234", or with degree/compass
+// markers like "50.4501° N, 30.5234° E".
+function parseCoordinates(raw: string): { lat: number; lon: number } | null {
+  const match = raw.trim().match(/(-?\d+\.?\d*)\s*°?\s*([NSns])?[,\s]+(-?\d+\.?\d*)\s*°?\s*([EWew])?/);
+  if (!match) return null;
+  let lat = Number(match[1]);
+  let lon = Number(match[3]);
+  if (match[2] && /[Ss]/.test(match[2])) lat = -Math.abs(lat);
+  if (match[4] && /[Ww]/.test(match[4])) lon = -Math.abs(lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+  return { lat, lon };
+}
+
 export class ImageryWatchPanel extends Panel {
   private areas: ImageryArea[] = [];
   private selectedAreaId: string | null = null;
@@ -66,6 +81,7 @@ export class ImageryWatchPanel extends Panel {
   private pendingCenter: { lat: number; lon: number } | null = null;
   private pendingName = '';
   private pendingRadiusKm = 15;
+  private pendingCoordsText = '';
   private cogViewer = new ImageryCogViewer();
   private suggestions: AreaSuggestion[] = [];
   private suggestionsLoaded = false;
@@ -216,6 +232,7 @@ export class ImageryWatchPanel extends Panel {
       this.pendingName = '';
       this.pendingRadiusKm = 15;
       this.pendingCenter = null;
+      this.pendingCoordsText = '';
       await this.loadAreas();
     } catch {
       showToast('Could not add area -- try again in a moment.');
@@ -322,6 +339,21 @@ export class ImageryWatchPanel extends Panel {
     const notifyHaInput = h('input', { type: 'checkbox', id: 'imagery-watch-notify-ha' }) as HTMLInputElement;
     const storeHighResInput = h('input', { type: 'checkbox', id: 'imagery-watch-store-highres' }) as HTMLInputElement;
 
+    const coordsInput = h('input', {
+      type: 'text', className: 'imagery-watch-coords-input', placeholder: 'or paste coordinates: 50.45, 30.52',
+      value: this.pendingCoordsText,
+      onInput: (e: Event) => { this.pendingCoordsText = (e.target as HTMLInputElement).value; },
+    }) as HTMLInputElement;
+    const applyCoordsText = () => {
+      const parsed = parseCoordinates(coordsInput.value);
+      if (!parsed) {
+        showToast('Could not read those as coordinates -- expected something like "50.45, 30.52".');
+        return;
+      }
+      this.pendingCenter = parsed;
+      this.render();
+    };
+
     return h('div', { className: 'imagery-watch-add-form' },
       nameInput,
       ...(this.suggestions.length > 0 ? [
@@ -334,6 +366,7 @@ export class ImageryWatchPanel extends Panel {
                 this.pendingName = s.name;
                 this.pendingRadiusKm = SUGGESTION_RADIUS_KM;
                 this.pendingCenter = { lat: s.lat, lon: s.lon };
+                this.pendingCoordsText = '';
                 this.render();
               },
             }, s.name),
@@ -345,11 +378,36 @@ export class ImageryWatchPanel extends Panel {
           className: 'btn btn-secondary',
           onClick: () => {
             this.pendingCenter = this.getMapCenter?.() ?? null;
+            this.pendingCoordsText = '';
             this.render();
           },
         }, center ? `Center: ${center.lat.toFixed(2)}, ${center.lon.toFixed(2)}` : 'Use current map view'),
         h('span', {}, 'radius (km)'),
         radiusInput,
+      ),
+      h('div', { className: 'imagery-watch-add-form-row' },
+        coordsInput,
+        h('button', {
+          className: 'btn btn-secondary',
+          title: 'Read coordinates from your clipboard',
+          onClick: async () => {
+            try {
+              const text = await navigator.clipboard.readText();
+              coordsInput.value = text;
+              this.pendingCoordsText = text;
+              const parsed = parseCoordinates(text);
+              if (parsed) {
+                this.pendingCenter = parsed;
+                this.render();
+              } else {
+                showToast('Clipboard didn\'t look like coordinates -- pasted it in, adjust and click "Use".');
+              }
+            } catch {
+              showToast('Couldn\'t read the clipboard automatically (browser permissions) -- paste into the field instead.');
+            }
+          },
+        }, '📋 Paste'),
+        h('button', { className: 'btn btn-secondary', onClick: applyCoordsText }, 'Use'),
       ),
       h('label', { className: 'imagery-watch-add-form-checkbox' },
         notifyHaInput,

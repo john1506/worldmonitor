@@ -7520,7 +7520,8 @@ a.prediction-link:hover {
 }
 
 .imagery-watch-name-input,
-.imagery-watch-radius-input {
+.imagery-watch-radius-input,
+.imagery-watch-coords-input {
   background: var(--bg);
   border: 1px solid var(--border);
   color: var(--text);
@@ -7531,6 +7532,11 @@ a.prediction-link:hover {
 
 .imagery-watch-radius-input {
   width: 56px;
+}
+
+.imagery-watch-coords-input {
+  flex: 1;
+  min-width: 0;
 }
 
 .imagery-watch-area-row {
