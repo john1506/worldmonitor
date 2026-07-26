@@ -7649,6 +7649,78 @@ a.prediction-link:hover {
   text-align: center;
 }
 
+/* Imagery Watch: replay (time-lapse) mode */
+.imagery-watch-detail-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 0;
+}
+
+.imagery-watch-replay {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0;
+}
+
+.imagery-watch-replay-img {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: 2px;
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.imagery-watch-replay-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.imagery-watch-replay-scrubber {
+  width: 100%;
+}
+
+/* "God's eye" technical readout -- dark, monospace, green accent, matching
+   the existing on-globe marker-tooltip aesthetic elsewhere in this app. */
+.imagery-watch-hud {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  background: rgba(10, 12, 16, 0.95);
+  border: 1px solid rgba(60, 120, 60, 0.6);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.imagery-watch-hud-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.imagery-watch-hud-label {
+  color: var(--green);
+  letter-spacing: 0.5px;
+  flex-shrink: 0;
+}
+
+.imagery-watch-hud-value {
+  color: #d4d4d4;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.imagery-watch-hud-delta {
+  color: var(--green);
+}
+
 /* Imagery Watch: full-resolution COG viewer modal */
 .imagery-cog-overlay {
   position: fixed;

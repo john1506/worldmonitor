@@ -47,6 +47,7 @@ const EARTH_DEG_KM = 111; // rough km-per-degree, fine for area-of-interest bbox
 const SUGGESTION_WINDOW_DAYS = 60;
 const SUGGESTION_COUNT = 5;
 const SUGGESTION_RADIUS_KM = 50; // country/region-level cluster, wider than the manual-pin default
+const REPLAY_INTERVAL_MS = 1500;
 
 function bboxFromCenter(lat: number, lon: number, radiusKm: number): [number, number, number, number] {
   const dLat = radiusKm / EARTH_DEG_KM;
@@ -69,6 +70,20 @@ function parseCoordinates(raw: string): { lat: number; lon: number } | null {
   return { lat, lon };
 }
 
+// Real revisit cadence is irregular (Sentinel-2 ~5 days, NAIP much less
+// often), so the replay HUD's "time since previous capture" reading is
+// itself informative -- a multi-week gap between frames is expected, not
+// a bug.
+function formatReplayDelta(ms: number): string {
+  const totalMinutes = Math.round(Math.abs(ms) / 60_000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `+${days}D ${hours}H`;
+  if (hours > 0) return `+${hours}H ${minutes}M`;
+  return `+${minutes}M`;
+}
+
 export class ImageryWatchPanel extends Panel {
   private areas: ImageryArea[] = [];
   private selectedAreaId: string | null = null;
@@ -85,6 +100,16 @@ export class ImageryWatchPanel extends Panel {
   private cogViewer = new ImageryCogViewer();
   private suggestions: AreaSuggestion[] = [];
   private suggestionsLoaded = false;
+  private replayAreaId: string | null = null;
+  private replayIndex = 0;
+  private replayPlaying = false;
+  private replayTimer: ReturnType<typeof setInterval> | null = null;
+  // Updated directly by the replay tick instead of going through the full
+  // render() -- a full re-render every REPLAY_INTERVAL_MS would rebuild the
+  // whole panel (area list, forms, everything) just to swap one image.
+  private replayImgEl: HTMLImageElement | null = null;
+  private replayScrubberEl: HTMLInputElement | null = null;
+  private replayHud: { frame: HTMLElement; source: HTMLElement; captured: HTMLElement; delta: HTMLElement } | null = null;
 
   constructor() {
     super({ id: 'imagery-watch', title: 'Imagery Watch', infoTooltip: 'Subscribe to an area and get notified when new free satellite imagery (Sentinel-2, and NAIP for US locations) is captured there.' });
@@ -244,6 +269,7 @@ export class ImageryWatchPanel extends Panel {
       await fetch(toApiUrl(`/api/imagery-watch/v1/areas?id=${encodeURIComponent(id)}`), { method: 'DELETE', signal: AbortSignal.timeout(10_000) });
       this.historyByArea.delete(id);
       if (this.selectedAreaId === id) this.selectedAreaId = null;
+      if (this.replayAreaId === id) this.stopReplay();
       await this.loadAreas();
     } catch {
       showToast('Could not remove area -- try again in a moment.');
@@ -289,7 +315,13 @@ export class ImageryWatchPanel extends Panel {
         h('div', {
           className: 'imagery-watch-area-thumb',
           onClick: () => {
-            this.selectedAreaId = isSelected ? null : area.id;
+            const nextSelectedId = isSelected ? null : area.id;
+            // Selecting a different area (or deselecting entirely) while a
+            // replay is running for the *previous* area would otherwise
+            // leave that interval ticking in the background against
+            // detached DOM elements -- harmless visually, but wasteful.
+            if (this.replayAreaId && this.replayAreaId !== nextSelectedId) this.stopReplay();
+            this.selectedAreaId = nextSelectedId;
             this.markAllSeen();
             this.render();
           },
@@ -313,7 +345,7 @@ export class ImageryWatchPanel extends Panel {
       list.appendChild(row);
 
       if (isSelected) {
-        list.appendChild(this.renderHistoryDetail(history));
+        list.appendChild(this.renderAreaDetail(area, history));
       }
     }
     this.content.appendChild(list);
@@ -433,7 +465,33 @@ export class ImageryWatchPanel extends Panel {
     );
   }
 
-  private renderHistoryDetail(history: ImageryScene[]): HTMLElement {
+  private renderAreaDetail(area: ImageryArea, history: ImageryScene[]): HTMLElement {
+    const inReplay = this.replayAreaId === area.id;
+    const wrapper = h('div', { className: 'imagery-watch-detail' });
+
+    if (history.length > 1) {
+      wrapper.appendChild(
+        h('div', { className: 'imagery-watch-detail-toolbar' },
+          h('button', {
+            className: 'btn btn-secondary',
+            onClick: () => {
+              if (inReplay) {
+                this.stopReplay();
+              } else {
+                this.startReplay(area.id, history.length);
+              }
+              this.render();
+            },
+          }, inReplay ? '☰ Grid view' : '▶ Replay'),
+        ),
+      );
+    }
+
+    wrapper.appendChild(inReplay ? this.renderReplay(area, history) : this.renderHistoryGrid(history));
+    return wrapper;
+  }
+
+  private renderHistoryGrid(history: ImageryScene[]): HTMLElement {
     if (history.length === 0) {
       return h('div', { className: 'imagery-watch-history-empty', style: 'color: var(--text-dim); font-size: 10px; padding: 8px 0;' }, 'No captures recorded yet -- check back after the next scan.');
     }
@@ -457,10 +515,150 @@ export class ImageryWatchPanel extends Panel {
     );
   }
 
+  // Time-lapse-style replay: steps through an area's history oldest-to-newest
+  // ("progression of time" is naturally forward, opposite of the grid's
+  // newest-first order). Real revisit cadence for these sources is
+  // irregular (Sentinel-2 ~5 days, NAIP much less often), so this reads more
+  // like a slideshow with visible jumps than a smooth video -- that's the
+  // real data, not a bug.
+  private startReplay(areaId: string, frameCount: number): void {
+    this.replayAreaId = areaId;
+    this.replayIndex = 0;
+    this.replayPlaying = frameCount > 1;
+    if (this.replayPlaying) this.scheduleReplayTick();
+  }
+
+  private stopReplay(): void {
+    this.replayAreaId = null;
+    this.replayPlaying = false;
+    if (this.replayTimer) {
+      clearInterval(this.replayTimer);
+      this.replayTimer = null;
+    }
+    this.replayImgEl = null;
+    this.replayScrubberEl = null;
+    this.replayHud = null;
+  }
+
+  private scheduleReplayTick(): void {
+    if (this.replayTimer) clearInterval(this.replayTimer);
+    this.replayTimer = setInterval(() => {
+      const chronological = [...(this.historyByArea.get(this.replayAreaId ?? '') ?? [])].reverse();
+      if (chronological.length === 0) return;
+      this.replayIndex = (this.replayIndex + 1) % chronological.length;
+      this.updateReplayFrame(chronological);
+    }, REPLAY_INTERVAL_MS);
+  }
+
+  private updateReplayFrame(chronological: ImageryScene[]): void {
+    const scene = chronological[this.replayIndex];
+    if (!scene) return;
+    if (this.replayImgEl) {
+      if (scene.previewUrl) this.replayImgEl.src = scene.previewUrl;
+      this.replayImgEl.alt = scene.satellite;
+    }
+    if (this.replayScrubberEl) {
+      this.replayScrubberEl.value = String(this.replayIndex);
+    }
+    if (this.replayHud) {
+      const previous = chronological[this.replayIndex - 1];
+      this.replayHud.frame.textContent = `${this.replayIndex + 1} / ${chronological.length}`;
+      this.replayHud.source.textContent = `${scene.satellite.toUpperCase()} · ${scene.resolutionM}M/PX`;
+      this.replayHud.captured.textContent = new Date(scene.datetime).toLocaleString();
+      this.replayHud.delta.textContent = previous
+        ? formatReplayDelta(Date.parse(scene.datetime) - Date.parse(previous.datetime))
+        : 'BASELINE (first capture)';
+    }
+  }
+
+  private renderReplay(area: ImageryArea, history: ImageryScene[]): HTMLElement {
+    const chronological = [...history].reverse();
+    const first = chronological[0];
+    const [west, south, east, north] = area.bbox;
+    const centerLat = (south + north) / 2;
+    const centerLon = (west + east) / 2;
+
+    const img = h('img', {
+      className: 'imagery-watch-replay-img',
+      src: first?.previewUrl || '',
+      alt: first?.satellite || '',
+      onClick: () => {
+        const scene = chronological[this.replayIndex];
+        if (scene && (scene.assetUrl || scene.previewUrl)) this.cogViewer.open(scene);
+      },
+    }) as HTMLImageElement;
+    this.replayImgEl = img;
+
+    const frameVal = h('span', { className: 'imagery-watch-hud-value' }, `1 / ${chronological.length}`);
+    const sourceVal = h('span', { className: 'imagery-watch-hud-value' }, first ? `${first.satellite.toUpperCase()} · ${first.resolutionM}M/PX` : '');
+    const capturedVal = h('span', { className: 'imagery-watch-hud-value' }, first ? new Date(first.datetime).toLocaleString() : '');
+    const deltaVal = h('span', { className: 'imagery-watch-hud-value imagery-watch-hud-delta' }, 'BASELINE (first capture)');
+    this.replayHud = { frame: frameVal, source: sourceVal, captured: capturedVal, delta: deltaVal };
+
+    const hud = h('div', { className: 'imagery-watch-hud' },
+      h('div', { className: 'imagery-watch-hud-row' }, h('span', { className: 'imagery-watch-hud-label' }, 'AREA'), h('span', { className: 'imagery-watch-hud-value' }, area.name.toUpperCase())),
+      h('div', { className: 'imagery-watch-hud-row' }, h('span', { className: 'imagery-watch-hud-label' }, 'COORDS'), h('span', { className: 'imagery-watch-hud-value' }, `${centerLat.toFixed(4)}, ${centerLon.toFixed(4)}`)),
+      h('div', { className: 'imagery-watch-hud-row' }, h('span', { className: 'imagery-watch-hud-label' }, 'SOURCE'), sourceVal),
+      h('div', { className: 'imagery-watch-hud-row' }, h('span', { className: 'imagery-watch-hud-label' }, 'CAPTURED'), capturedVal),
+      h('div', { className: 'imagery-watch-hud-row' }, h('span', { className: 'imagery-watch-hud-label' }, 'Δ PREV'), deltaVal),
+      h('div', { className: 'imagery-watch-hud-row' }, h('span', { className: 'imagery-watch-hud-label' }, 'FRAME'), frameVal),
+    );
+
+    const scrubber = h('input', {
+      type: 'range', className: 'imagery-watch-replay-scrubber',
+      min: '0', max: String(Math.max(0, chronological.length - 1)), value: String(this.replayIndex),
+      onInput: (e: Event) => {
+        this.replayIndex = Number((e.target as HTMLInputElement).value);
+        this.updateReplayFrame(chronological);
+      },
+    }) as HTMLInputElement;
+    this.replayScrubberEl = scrubber;
+
+    const playPauseBtn = h('button', {
+      className: 'btn btn-secondary',
+      onClick: () => {
+        this.replayPlaying = !this.replayPlaying;
+        if (this.replayPlaying) {
+          this.scheduleReplayTick();
+        } else if (this.replayTimer) {
+          clearInterval(this.replayTimer);
+          this.replayTimer = null;
+        }
+        playPauseBtn.textContent = this.replayPlaying ? '⏸' : '▶';
+      },
+    }, this.replayPlaying ? '⏸' : '▶');
+
+    const step = (delta: number) => {
+      if (chronological.length === 0) return;
+      this.replayIndex = (this.replayIndex + delta + chronological.length) % chronological.length;
+      this.updateReplayFrame(chronological);
+    };
+
+    // Render at the frame the scrubber/state already points to (e.g.
+    // re-opening a replay already in progress, or after a poll refreshed
+    // the history array with new captures).
+    this.updateReplayFrame(chronological);
+
+    return h('div', { className: 'imagery-watch-replay' },
+      img,
+      hud,
+      h('div', { className: 'imagery-watch-replay-controls' },
+        h('button', { className: 'btn btn-secondary', onClick: () => step(-1) }, '◀'),
+        playPauseBtn,
+        h('button', { className: 'btn btn-secondary', onClick: () => step(1) }, '▶'),
+      ),
+      scrubber,
+    );
+  }
+
   public override destroy(): void {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
+    }
+    if (this.replayTimer) {
+      clearInterval(this.replayTimer);
+      this.replayTimer = null;
     }
     this.cogViewer.close();
     super.destroy();
