@@ -56,6 +56,7 @@ import type { ClimateAnomaly } from '@/services/climate';
 import type { GpsJamHex } from '@/services/gps-interference';
 import type { SatellitePosition } from '@/services/satellites';
 import type { ImageryScene } from '@/generated/server/worldmonitor/imagery/v1/service_server';
+import type { ImageryWatchAreaPin } from '@/types';
 import { isAllowedPreviewUrl } from '@/utils/imagery-preview';
 import { getCategoryStyle } from '@/services/webcams';
 import { pinWebcam, isPinned } from '@/services/webcams/pinned-store';
@@ -405,6 +406,9 @@ interface ImagerySceneMarker extends BaseMarker {
   mode: string;
   previewUrl: string;
 }
+interface ImageryWatchAreaMarker extends BaseMarker, ImageryWatchAreaPin {
+  _kind: 'imageryWatchArea';
+}
 interface WebcamMarkerData extends BaseMarker {
   _kind: 'webcam';
   webcamId: string;
@@ -452,7 +456,7 @@ type GlobeMarker =
   | EarthquakeMarker | RadiationMarker | EconomicMarker | DatacenterMarker | WaterwayMarker | MineralMarker
   | FlightDelayMarker | NotamRingMarker | CableAdvisoryMarker | RepairShipMarker | AisDisruptionMarker
   | NewsLocationMarker | FlashMarker | SatelliteMarker | SatFootprintMarker | ImagerySceneMarker
-  | WebcamMarkerData | WebcamClusterData;
+  | WebcamMarkerData | WebcamClusterData | ImageryWatchAreaMarker;
 
 interface GlobeControlsLike {
   autoRotate: boolean;
@@ -552,6 +556,7 @@ export class GlobeMap {
   private stormConePolygons: GlobePolygon[] = [];
   private satelliteFootprintMarkers: SatFootprintMarker[] = [];
   private imagerySceneMarkers: ImagerySceneMarker[] = [];
+  private imageryWatchAreaMarkers: ImageryWatchAreaMarker[] = [];
   private webcamMarkers: (WebcamMarkerData | WebcamClusterData)[] = [];
   private webcamMarkerMode: string = (() => {
     try {
@@ -584,6 +589,11 @@ export class GlobeMap {
 
   // Auto-rotate timer (like Sentinel: resume after 60 s idle)
   private autoRotateTimer: ReturnType<typeof setTimeout> | null = null;
+  // User-toggleable override: when set, auto-rotate stays off even after the
+  // normal 60s idle window elapses -- lets someone study a specific region
+  // without the globe drifting back into motion on its own.
+  private rotationLocked = localStorage.getItem('wm-globe-rotation-locked') === '1';
+  private rotationLockBtn: HTMLButtonElement | null = null;
 
   // Overlay UI elements
   private layerTogglesEl: HTMLElement | null = null;
@@ -689,7 +699,7 @@ export class GlobeMap {
     // surviving/second pointer's position in mixed mouse|pen + touch gestures —
     // crashes reading undefined.x on touchscreen laptops (WORLDMONITOR-QD).
     guardOrbitControlsPointerTracking(controls);
-    controls.autoRotate = !desktop;
+    controls.autoRotate = this.rotationLocked ? false : !desktop;
     controls.autoRotateSpeed = 0.3;
     controls.enablePan = false;
     controls.enableZoom = true;
@@ -739,34 +749,20 @@ export class GlobeMap {
       if (this.globe) this.globe.globeImageUrl(GLOBE_TEXTURE_URLS[texture]);
     });
 
-    // Pause auto-rotate on user interaction; resume after 60 s idle (like Sentinel)
-    const pauseAutoRotate = () => {
-      if (this.renderPaused) return;
-      controls.autoRotate = false;
-      if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
-    };
-    const scheduleResumeAutoRotate = () => {
-      if (this.renderPaused) return;
-      if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
-      this.autoRotateTimer = setTimeout(() => {
-        if (!this.renderPaused) controls.autoRotate = !desktop;
-      }, 60_000);
-    };
-
     const canvas = this.container.querySelector('canvas');
     if (canvas) {
       // Wake globe on any user interaction (idle rendering optimization)
       const wakeOnInteraction = () => this.wakeGlobe();
-      canvas.addEventListener('mousedown', () => { pauseAutoRotate(); wakeOnInteraction(); });
-      canvas.addEventListener('touchstart', () => { pauseAutoRotate(); wakeOnInteraction(); }, { passive: true });
+      canvas.addEventListener('mousedown', () => { this.pauseAutoRotate(); wakeOnInteraction(); });
+      canvas.addEventListener('touchstart', () => { this.pauseAutoRotate(); wakeOnInteraction(); }, { passive: true });
       canvas.addEventListener('wheel', wakeOnInteraction, { passive: true });
       let lastMoveWake = 0;
       canvas.addEventListener('mousemove', () => {
         const now = performance.now();
         if (now - lastMoveWake > 500) { lastMoveWake = now; wakeOnInteraction(); }
       }, { passive: true });
-      canvas.addEventListener('mouseup', scheduleResumeAutoRotate);
-      canvas.addEventListener('touchend', scheduleResumeAutoRotate);
+      canvas.addEventListener('mouseup', () => this.scheduleResumeAutoRotate());
+      canvas.addEventListener('touchend', () => this.scheduleResumeAutoRotate());
       canvas.addEventListener('webglcontextlost', (e) => {
         e.preventDefault();
         this.webglLost = true;
@@ -1261,6 +1257,9 @@ export class GlobeMap {
     } else if (d._kind === 'imageryScene') {
       setTrustedHtml(el, trustedHtml(GlobeMap.wrapHit(`<div style="font-size:11px;color:#00b4ff;text-shadow:0 0 4px #00b4ff88;">&#128752;</div>`), "legacy direct innerHTML migration"));
       el.title = `${d.satellite} ${d.datetime}`;
+    } else if (d._kind === 'imageryWatchArea') {
+      setTrustedHtml(el, trustedHtml(GlobeMap.wrapHit(`<div style="font-size:13px;color:#39ff6a;text-shadow:0 0 5px #39ff6a99;">&#128204;</div>`), "legacy direct innerHTML migration"));
+      el.title = `${d.name} (Imagery Watch)`;
     } else if (d._kind === 'webcam') {
       const style = getCategoryStyle(d.category);
       const emoji = this.webcamMarkerMode === 'emoji' ? style.emoji : '\u{1F4F7}';
@@ -1396,7 +1395,11 @@ export class GlobeMap {
       'font-family:var(--font-mono)',
       'color:#d4d4d4',
       'max-width:280px',
-      'z-index:1000',
+      // Must clear three-globe's CSS2DRenderer zOrder(), which assigns each
+      // rendered marker glyph its own inline z-index up to the current
+      // marker count -- a busy view (satellites + everything else) can
+      // exceed any small static value here. Same fix as .deckgl-layer-toggles.
+      'z-index:10000',
       'pointer-events:auto',
       'line-height:1.5',
     ].join(';');
@@ -1642,6 +1645,16 @@ export class GlobeMap {
       }
       if (isAllowedPreviewUrl(d.previewUrl)) {
         const safeHref = escapeHtml(new URL(d.previewUrl!).href);
+        html += `<br><img src="${safeHref}" referrerpolicy="no-referrer" style="max-width:180px;max-height:120px;margin-top:4px;border-radius:4px;" class="imagery-preview">`;
+      }
+    } else if (d._kind === 'imageryWatchArea') {
+      html = `<span style="color:#39ff6a;font-weight:bold;">&#128204; ${esc(d.name)}</span>` +
+             `<br><span style="opacity:.7;">Imagery Watch · ${d.captureCount} capture${d.captureCount === 1 ? '' : 's'}</span>`;
+      if (d.latestDatetime) {
+        html += `<br><span style="opacity:.5;">Latest: ${esc(new Date(d.latestDatetime).toLocaleString())}</span>`;
+      }
+      if (isAllowedPreviewUrl(d.latestPreviewUrl ?? undefined)) {
+        const safeHref = escapeHtml(new URL(d.latestPreviewUrl!).href);
         html += `<br><img src="${safeHref}" referrerpolicy="no-referrer" style="max-width:180px;max-height:120px;margin-top:4px;border-radius:4px;" class="imagery-preview">`;
       }
     } else if (d._kind === 'webcam') {
@@ -1894,6 +1907,7 @@ export class GlobeMap {
         <button class="map-btn zoom-in"    title="Zoom in">+</button>
         <button class="map-btn zoom-out"   title="Zoom out">-</button>
         <button class="map-btn zoom-reset" title="Reset view">&#8962;</button>
+        <button class="map-btn rotation-lock" title="Lock rotation (stop the globe from auto-rotating)">&#128275;</button>
       </div>`, "legacy direct innerHTML migration"));
     this.container.appendChild(el);
     el.addEventListener('click', (e) => {
@@ -1901,7 +1915,15 @@ export class GlobeMap {
       if      (target.classList.contains('zoom-in'))    this.zoomInGlobe();
       else if (target.classList.contains('zoom-out'))   this.zoomOutGlobe();
       else if (target.classList.contains('zoom-reset')) this.setView(this.currentView);
+      else if (target.classList.contains('rotation-lock')) this.toggleRotationLock();
     });
+    const lockBtn = el.querySelector<HTMLButtonElement>('.rotation-lock');
+    this.rotationLockBtn = lockBtn;
+    if (lockBtn && this.rotationLocked) {
+      lockBtn.classList.add('active');
+      lockBtn.title = 'Rotation locked — click to allow auto-rotate again';
+      setTrustedHtml(lockBtn, trustedHtml('&#128274;', "static icon toggle"));
+    }
   }
 
   private zoomInGlobe(): void {
@@ -2152,6 +2174,7 @@ export class GlobeMap {
     if (this.layers.webcams) markers.push(...this.webcamMarkers);
     markers.push(...this.newsLocationMarkers);
     markers.push(...this.flashMarkers);
+    markers.push(...this.imageryWatchAreaMarkers);
 
     try {
       this.globe.htmlElementsData(markers);
@@ -3075,6 +3098,26 @@ export class GlobeMap {
     }
   }
 
+  // Subscribed Imagery Watch areas -- always shown regardless of the
+  // "satellites" layer toggle, same precedent as newsLocation/flash markers:
+  // this is a small, user-curated list rather than a noisy data layer, so it
+  // doesn't need its own layer-visibility switch.
+  public setImageryWatchAreas(areas: ImageryWatchAreaPin[]): void {
+    this.imageryWatchAreaMarkers = (areas ?? []).map((a) => ({
+      _kind: 'imageryWatchArea' as const,
+      _lat: a.lat,
+      _lng: a.lon,
+      id: a.id,
+      name: a.name,
+      lat: a.lat,
+      lon: a.lon,
+      captureCount: a.captureCount,
+      latestDatetime: a.latestDatetime,
+      latestPreviewUrl: a.latestPreviewUrl,
+    }));
+    this.flushMarkers();
+  }
+
   private async fetchImageryForViewport(): Promise<void> {
     if (this.destroyed) return;
     const center = this.getCenter();
@@ -3672,6 +3715,41 @@ export class GlobeMap {
 
     if (prevPulse !== this._pulseEnabled) {
       this.flushMarkers();
+    }
+  }
+
+  // ─── Auto-rotate ──────────────────────────────────────────────────────────
+  // Pause auto-rotate on user interaction; resume after 60 s idle (like
+  // Sentinel) -- unless the user has locked rotation off entirely.
+
+  private pauseAutoRotate(): void {
+    if (this.renderPaused || !this.controls) return;
+    this.controls.autoRotate = false;
+    if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
+  }
+
+  private scheduleResumeAutoRotate(): void {
+    if (this.renderPaused || this.rotationLocked) return;
+    if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
+    this.autoRotateTimer = setTimeout(() => {
+      if (!this.renderPaused && !this.rotationLocked && this.controls) {
+        this.controls.autoRotate = !isDesktopRuntime();
+      }
+    }, 60_000);
+  }
+
+  private toggleRotationLock(): void {
+    this.rotationLocked = !this.rotationLocked;
+    localStorage.setItem('wm-globe-rotation-locked', this.rotationLocked ? '1' : '0');
+    if (this.rotationLocked) {
+      this.pauseAutoRotate();
+    } else {
+      this.scheduleResumeAutoRotate();
+    }
+    if (this.rotationLockBtn) {
+      this.rotationLockBtn.classList.toggle('active', this.rotationLocked);
+      this.rotationLockBtn.title = this.rotationLocked ? 'Rotation locked — click to allow auto-rotate again' : 'Lock rotation (stop the globe from auto-rotating)';
+      setTrustedHtml(this.rotationLockBtn, trustedHtml(this.rotationLocked ? '&#128274;' : '&#128275;', "static icon toggle"));
     }
   }
 

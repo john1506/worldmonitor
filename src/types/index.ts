@@ -1558,3 +1558,16 @@ export interface CountryBriefSignals {
   sanctionsDesignations: number;
   sanctionsNewDesignations: number;
 }
+
+// A subscribed Imagery Watch area, projected down to just what the map
+// views (GlobeMap, DeckGLMap) need to render a pin + tooltip -- the full
+// area record (bbox, notification prefs, etc.) lives in ImageryWatchPanel.
+export interface ImageryWatchAreaPin {
+  id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  captureCount: number;
+  latestDatetime: string | null;
+  latestPreviewUrl: string | null;
+}

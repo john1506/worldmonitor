@@ -2042,6 +2042,7 @@ export class PanelLayoutManager implements AppModule {
     this.lazyImportedPanel('imagery-watch', () => import('@/components/ImageryWatchPanel'), 'ImageryWatchPanel', (ImageryWatchPanel) => {
       const panel = new ImageryWatchPanel();
       panel.setGetMapCenterHandler(() => this.ctx.map?.getCenter() ?? null);
+      panel.setSyncMapAreasHandler((areas) => this.ctx.map?.setImageryWatchAreas(areas));
       return panel;
     });
 

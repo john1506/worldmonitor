@@ -49,6 +49,7 @@ import { CII_LEVEL_COLORS, type CiiLevel } from '@/config/cii-colors';
 import type { GpsJamHex } from '@/services/gps-interference';
 import { fetchImageryScenes } from '@/services/imagery';
 import type { ImageryScene } from '@/generated/server/worldmonitor/imagery/v1/service_server';
+import type { ImageryWatchAreaPin } from '@/types';
 import type { TrafficAnomaly as ProtoTrafficAnomaly, DdosLocationHit } from '@/generated/client/worldmonitor/infrastructure/v1/service_client';
 import type { DisplacementFlow } from '@/services/displacement';
 import type { Earthquake } from '@/services/earthquakes';
@@ -616,6 +617,7 @@ export class DeckGLMap {
   private imageryScenes: ImageryScene[] = [];
   private imagerySearchTimer: ReturnType<typeof setTimeout> | null = null;
   private imagerySearchVersion = 0;
+  private imageryWatchAreas: ImageryWatchAreaPin[] = [];
 
   // Phase 8 overlay data
   private happinessScores: Map<string, number> = new Map();
@@ -2224,6 +2226,11 @@ export class DeckGLMap {
     // News geo-locations (always shown if data exists)
     if (this.newsLocations.length > 0) {
       layers.push(...this.createNewsLocationsLayer());
+    }
+
+    // Imagery Watch subscribed areas (always shown if any exist)
+    if (this.imageryWatchAreas.length > 0) {
+      layers.push(this.createImageryWatchAreasLayer());
     }
 
     const result = layers.filter(Boolean) as LayersList;
@@ -4645,6 +4652,30 @@ export class DeckGLMap {
     });
   }
 
+  private createImageryWatchAreasLayer(): ScatterplotLayer<ImageryWatchAreaPin> {
+    return new ScatterplotLayer<ImageryWatchAreaPin>({
+      id: 'imagery-watch-areas-layer',
+      data: this.imageryWatchAreas,
+      getPosition: (d) => [d.lon, d.lat],
+      getRadius: 8000,
+      getFillColor: [57, 255, 106, 210] as [number, number, number, number],
+      getLineColor: [10, 20, 10, 220] as [number, number, number, number],
+      lineWidthMinPixels: 1,
+      stroked: true,
+      radiusMinPixels: 5,
+      radiusMaxPixels: 11,
+      pickable: true,
+    });
+  }
+
+  // Subscribed Imagery Watch areas -- always shown, same precedent as the
+  // always-on news-locations layer above (small user-curated list, not a
+  // togglable data layer).
+  public setImageryWatchAreas(areas: ImageryWatchAreaPin[]): void {
+    this.imageryWatchAreas = areas ?? [];
+    this.render();
+  }
+
   private async fetchImageryForViewport(): Promise<void> {
     const map = this.maplibreMap;
     if (!map) return;
@@ -4810,6 +4841,11 @@ export class DeckGLMap {
       }
       case 'spaceports-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(obj.country || t('components.deckgl.layers.spaceports'))}</div>` };
+      case 'imagery-watch-areas-layer': {
+        const pin = obj as ImageryWatchAreaPin;
+        const latestStr = pin.latestDatetime ? `<br/><span style="opacity:.6">Latest: ${text(new Date(pin.latestDatetime).toLocaleString())}</span>` : '';
+        return { html: `<div class="deckgl-tooltip"><strong style="color:#39ff6a;">\u{1F4CC} ${text(pin.name)}</strong><br/>Imagery Watch · ${pin.captureCount} capture${pin.captureCount === 1 ? '' : 's'}${latestStr}</div>` };
+      }
       case 'ports-layer': {
         const typeIcon = obj.type === 'naval' ? '⚓' : obj.type === 'oil' || obj.type === 'lng' ? '🛢️' : '🏭';
         return { html: `<div class="deckgl-tooltip"><strong>${typeIcon} ${text(obj.name)}</strong><br/>${text(obj.type || t('components.deckgl.tooltip.port'))} - ${text(obj.country)}</div>` };

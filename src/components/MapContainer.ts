@@ -46,6 +46,7 @@ import type { GpsJamHex } from '@/services/gps-interference';
 import type { SatellitePosition } from '@/services/satellites';
 import type { IranEvent } from '@/services/conflict';
 import type { ImageryScene } from '@/generated/server/worldmonitor/imagery/v1/service_server';
+import type { ImageryWatchAreaPin } from '@/types';
 import type { WebcamEntry, WebcamCluster } from '@/generated/client/worldmonitor/webcam/v1/service_client';
 import type { TrafficAnomaly as ProtoTrafficAnomaly, DdosLocationHit } from '@/generated/client/worldmonitor/infrastructure/v1/service_client';
 import type { AcledConflictEvent } from '@/generated/client/worldmonitor/conflict/v1/service_client';
@@ -205,6 +206,7 @@ export class MapContainer {
   private cachedEscalationFlights: MilitaryFlight[] | null = null;
   private cachedEscalationVessels: MilitaryVessel[] | null = null;
   private cachedImageryScenes: ImageryScene[] | null = null;
+  private cachedImageryWatchAreas: ImageryWatchAreaPin[] | null = null;
   private cachedWebcams: Array<WebcamEntry | WebcamCluster> | null = null;
   private cachedTrafficAnomalies: ProtoTrafficAnomaly[] | null = null;
   private cachedDdosLocations: DdosLocationHit[] | null = null;
@@ -664,6 +666,7 @@ export class MapContainer {
     if (this.cachedHotspotActivity) this.updateHotspotActivity(this.cachedHotspotActivity);
     if (this.cachedEscalationFlights && this.cachedEscalationVessels) this.updateMilitaryForEscalation(this.cachedEscalationFlights, this.cachedEscalationVessels);
     if (this.cachedImageryScenes) this.setImageryScenes(this.cachedImageryScenes);
+    if (this.cachedImageryWatchAreas) this.setImageryWatchAreas(this.cachedImageryWatchAreas);
     if (this.cachedTrafficAnomalies) this.setTrafficAnomalies(this.cachedTrafficAnomalies);
     if (this.cachedDdosLocations) this.setDdosLocations(this.cachedDdosLocations);
     if (this.cachedChokepointData !== undefined) this.setChokepointData(this.cachedChokepointData);
@@ -832,6 +835,12 @@ export class MapContainer {
     this.cachedImageryScenes = scenes;
     if (this.useGlobe) { this.globeMap?.setImageryScenes(scenes); return; }
     if (this.useDeckGL) { this.deckGLMap?.setImageryScenes(scenes); }
+  }
+
+  public setImageryWatchAreas(areas: ImageryWatchAreaPin[]): void {
+    this.cachedImageryWatchAreas = areas;
+    if (this.useGlobe) { this.globeMap?.setImageryWatchAreas(areas); return; }
+    if (this.useDeckGL) { this.deckGLMap?.setImageryWatchAreas(areas); }
   }
 
   public setWebcams(markers: Array<WebcamEntry | WebcamCluster>): void {
@@ -1540,6 +1549,7 @@ export class MapContainer {
     this.cachedEscalationFlights = null;
     this.cachedEscalationVessels = null;
     this.cachedImageryScenes = null;
+    this.cachedImageryWatchAreas = null;
     this.cachedTrafficAnomalies = null;
     this.cachedDdosLocations = null;
     this.cachedChokepointData = undefined;

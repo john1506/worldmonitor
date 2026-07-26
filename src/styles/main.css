@@ -7649,38 +7649,18 @@ a.prediction-link:hover {
   text-align: center;
 }
 
-/* Imagery Watch: replay (time-lapse) mode */
+/* Imagery Watch: replay toolbar (playback itself lives in the COG viewer) */
 .imagery-watch-detail-toolbar {
   display: flex;
   justify-content: flex-end;
   padding: 4px 0;
 }
 
-.imagery-watch-replay {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 8px 0;
-}
-
-.imagery-watch-replay-img {
-  width: 100%;
-  aspect-ratio: 4 / 3;
-  object-fit: cover;
-  border-radius: 2px;
-  background: var(--bg);
-  cursor: pointer;
-}
-
-.imagery-watch-replay-controls {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-}
-
-.imagery-watch-replay-scrubber {
-  width: 100%;
+.imagery-watch-history-item-gap {
+  display: block;
+  color: #e0a030;
+  font-size: 9px;
+  letter-spacing: 0.3px;
 }
 
 /* "God's eye" technical readout -- dark, monospace, green accent, matching
@@ -7721,6 +7701,10 @@ a.prediction-link:hover {
   color: var(--green);
 }
 
+.imagery-watch-hud-delta-warning {
+  color: #e0a030;
+}
+
 /* Imagery Watch: full-resolution COG viewer modal */
 .imagery-cog-overlay {
   position: fixed;
@@ -7751,6 +7735,142 @@ a.prediction-link:hover {
   padding: 4px 8px;
 }
 
+/* Holds the pan/zoom viewport plus the HUD, side by side on wide screens
+   and stacked on narrow ones -- the HUD needs a home now that it moved out
+   of the panel and into this modal alongside playback. */
+.imagery-cog-body {
+  flex: 1;
+  display: flex;
+  gap: 12px;
+  padding: 0 16px;
+  min-height: 0;
+}
+
+.imagery-cog-hud {
+  flex-shrink: 0;
+  width: 220px;
+  align-self: flex-start;
+}
+
+@media (max-width: 640px) {
+  .imagery-cog-body {
+    flex-direction: column;
+  }
+  .imagery-cog-hud {
+    width: auto;
+  }
+}
+
+.imagery-cog-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 16px 0;
+  flex-shrink: 0;
+}
+
+.imagery-cog-controls-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.imagery-cog-scrubber {
+  width: 100%;
+}
+
+.imagery-cog-compare-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+}
+
+.imagery-cog-compare-controls-col {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.imagery-cog-compare-controls-label {
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  width: 14px;
+  text-align: center;
+}
+
+/* Before/after reveal slider: B sits on top of A, clipped from the left so
+   only the region right of the handle shows B -- dragging the handle moves
+   the reveal boundary. Built on the small previews, not the full-res COG
+   canvas (see the comment on ImageryCogViewer's compare fields). */
+.imagery-cog-compare-stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.imagery-cog-compare-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  user-select: none;
+  pointer-events: none;
+}
+
+.imagery-cog-compare-label {
+  position: absolute;
+  top: 8px;
+  padding: 2px 8px;
+  background: rgba(10, 12, 16, 0.85);
+  color: var(--green);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+.imagery-cog-compare-label-a {
+  left: 8px;
+}
+
+.imagery-cog-compare-label-b {
+  right: 8px;
+}
+
+.imagery-cog-compare-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  left: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 6px rgba(0, 0, 0, 0.8);
+  cursor: ew-resize;
+  transform: translateX(-50%);
+}
+
+.imagery-cog-compare-handle::before {
+  content: '⇄';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #fff;
+  color: #111;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  cursor: ew-resize;
+}
+
 .imagery-cog-viewport {
   flex: 1;
   position: relative;
@@ -7759,17 +7879,62 @@ a.prediction-link:hover {
   align-items: center;
   justify-content: center;
   cursor: grab;
+  min-height: 0;
 }
 
 .imagery-cog-viewport.dragging {
   cursor: grabbing;
 }
 
-.imagery-cog-canvas {
+.imagery-cog-stage {
+  position: relative;
+  display: inline-block;
   max-width: 100%;
   max-height: 100%;
   transform-origin: center center;
+}
+
+.imagery-cog-canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
   user-select: none;
+}
+
+/* Marks where the tracked coordinate actually falls within the image --
+   it can land anywhere in the scene's footprint, not just the center. */
+.imagery-cog-crosshair {
+  position: absolute;
+  width: 28px;
+  height: 28px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  border: 2px solid #ff3b3b;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 8px 2px rgba(255, 59, 59, 0.6);
+}
+
+.imagery-cog-crosshair::before,
+.imagery-cog-crosshair::after {
+  content: '';
+  position: absolute;
+  background: #ff3b3b;
+}
+
+.imagery-cog-crosshair::before {
+  left: 50%;
+  top: -8px;
+  bottom: -8px;
+  width: 1px;
+  transform: translateX(-50%);
+}
+
+.imagery-cog-crosshair::after {
+  top: 50%;
+  left: -8px;
+  right: -8px;
+  height: 1px;
+  transform: translateY(-50%);
 }
 
 .imagery-cog-status {
@@ -17175,7 +17340,11 @@ a.prediction-link:hover {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  z-index: 500;
+  /* Shared with GlobeMap, whose markers can exceed z-index 500 via
+     three-globe's dynamic zOrder() -- see .deckgl-layer-toggles. Harmless
+     for DeckGLMap too, since its markers are WebGL canvas pixels with no
+     z-index of their own. */
+  z-index: 10000;
   pointer-events: auto;
 }
 
@@ -17205,6 +17374,12 @@ a.prediction-link:hover {
 .deckgl-controls .map-btn:hover {
   background: var(--bg);
   border-color: var(--green);
+}
+
+.deckgl-controls .map-btn.rotation-lock.active {
+  background: var(--green);
+  border-color: var(--green);
+  color: #0a0c10;
 }
 
 .deckgl-controls .view-selector {
@@ -17523,7 +17698,10 @@ a.prediction-link:hover {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
-  z-index: 210;
+  /* Appended into the globe container, so it's subject to the same
+     three-globe zOrder() dynamic marker z-index as .deckgl-layer-toggles
+     and the marker tooltip -- see those for the full explanation. */
+  z-index: 10000;
   overflow: hidden;
   box-shadow: 0 8px 32px var(--shadow-color);
 }
