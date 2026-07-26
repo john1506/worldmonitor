@@ -17211,7 +17211,19 @@ a.prediction-link:hover {
   position: absolute;
   bottom: 10px;
   left: 10px;
-  z-index: 100;
+  /* On the 3D globe, marker/glyph elements are positioned by three-globe's
+     CSS2DRenderer, which assigns each one an explicit inline z-index for
+     depth-sorting (zIndex = markerCount - i -- see zOrder() in
+     globe.gl/dist/globe.gl.js). With enough markers on screen at once
+     (flights + ships + conflict events + satellites can easily add up),
+     that count exceeds a z-index of 100, so the panel -- despite being
+     appended after those markers in the DOM -- ends up rendered behind
+     them. Needs a value comfortably above any realistic marker count;
+     matches the "definitely on top" range (10000+) already used
+     elsewhere in this stylesheet for modals/overlays, not just barely
+     above 100.
+  */
+  z-index: 10000;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
