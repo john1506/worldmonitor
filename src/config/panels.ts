@@ -54,13 +54,7 @@ const FULL_PANELS: Record<string, PanelConfig> = {
   'energy-complex': { name: 'Energy Complex', enabled: true, priority: 1 },
   'oil-inventories': { name: 'Oil Inventories', enabled: true, priority: 60 },
   markets: { name: 'Markets', enabled: true, priority: 1 },
-  'stock-analysis': { name: 'Stock Analysis', enabled: true, priority: 1, premium: 'locked' as const },
-  'stock-backtest': { name: 'Backtesting', enabled: true, priority: 1, premium: 'locked' as const },
-  'daily-market-brief': { name: 'Daily Market Brief', enabled: true, priority: 1, premium: 'locked' as const },
-  'chat-analyst': { name: 'WM Analyst', enabled: true, priority: 1, premium: 'locked' as const },
   economic: { name: 'Macro Stress', enabled: true, priority: 1 },
-  'global-procurement': { name: 'Global Procurement', enabled: true, priority: 1, premium: 'locked' as const },
-  'trade-policy': { name: 'Trade Policy', enabled: true, priority: 1, premium: 'locked' as const },
   'supply-chain': { name: 'Supply Chain', enabled: true, priority: 1, ...(_desktop && { premium: 'enhanced' as const }) },
   finance: { name: 'Financial', enabled: true, priority: 1 },
   tech: { name: 'Technology', enabled: true, priority: 2 },
@@ -69,7 +63,6 @@ const FULL_PANELS: Record<string, PanelConfig> = {
   ai: { name: 'AI/ML', enabled: true, priority: 2 },
   layoffs: { name: 'Layoffs Tracker', enabled: true, priority: 2 },
   monitors: { name: 'My Monitors', enabled: true, priority: 2 },
-  'latest-brief': { name: 'Latest Brief', enabled: true, priority: 1, premium: 'locked' as const },
   'satellite-fires': { name: 'Fires', enabled: true, priority: 2 },
   'macro-signals': { name: 'Market Regime', enabled: true, priority: 2 },
   'fear-greed': { name: 'Fear & Greed', enabled: true, priority: 2 },
@@ -102,7 +95,6 @@ const FULL_PANELS: Record<string, PanelConfig> = {
   'ucdp-events': { name: 'UCDP Conflict Events', enabled: true, priority: 2 },
   'disease-outbreaks': { name: 'Disease Outbreaks', enabled: true, priority: 2 },
   'social-velocity': { name: 'Social Velocity', enabled: true, priority: 2 },
-  'wsb-ticker-scanner': { name: 'WSB Ticker Scanner', enabled: true, priority: 75, premium: 'locked' as const },
   giving: { name: 'Global Giving', enabled: false, priority: 2 },
   displacement: { name: 'UNHCR Displacement', enabled: true, priority: 2 },
   climate: { name: 'Climate Anomalies', enabled: true, priority: 2 },
@@ -120,9 +112,6 @@ const FULL_PANELS: Record<string, PanelConfig> = {
   'world-clock': { name: 'World Clock', enabled: true, priority: 2 },
   'national-debt': { name: 'Global Debt Clock', enabled: true, priority: 2 },
   'cross-source-signals': { name: 'Cross-Source Signals', enabled: true, priority: 2 },
-  'market-implications': { name: 'AI Market Implications', enabled: true, priority: 1, premium: 'locked' as const },
-  'regional-intelligence': { name: 'Regional Intelligence', enabled: false, priority: 1, premium: 'locked' as const },
-  'deduction': { name: 'Deduct Situation', enabled: false, priority: 1, premium: 'locked' as const },
   'geo-hubs': { name: 'Geopolitical Hubs', enabled: false, priority: 2 },
   'tech-hubs': { name: 'Hot Tech Hubs', enabled: false, priority: 2 },
 };
@@ -291,7 +280,6 @@ const TECH_PANELS: Record<string, PanelConfig> = {
   'internet-disruptions': { name: 'Internet Disruptions', enabled: true, priority: 2 },
   'service-status': { name: 'Service Status', enabled: true, priority: 2 },
   economic: { name: 'Macro Stress', enabled: true, priority: 2 },
-  'global-procurement': { name: 'Global Procurement', enabled: true, priority: 1, premium: 'locked' as const },
   'tech-readiness': { name: 'Tech Readiness Index', enabled: true, priority: 1 },
   'macro-signals': { name: 'Market Regime', enabled: true, priority: 2 },
   'etf-flows': { name: 'BTC ETF Tracker', enabled: true, priority: 2 },
@@ -299,7 +287,6 @@ const TECH_PANELS: Record<string, PanelConfig> = {
   'airline-intel': { name: 'Airline Intelligence', enabled: true, priority: 2 },
   'world-clock': { name: 'World Clock', enabled: true, priority: 2 },
   monitors: { name: 'My Monitors', enabled: true, priority: 2 },
-  'latest-brief': { name: 'Latest Brief', enabled: true, priority: 1, premium: 'locked' as const },
   'tech-hubs': { name: 'Hot Tech Hubs', enabled: false, priority: 2 },
   'ai-regulation': { name: 'AI Regulation Dashboard', enabled: false, priority: 2 },
 };
@@ -438,9 +425,6 @@ const FINANCE_PANELS: Record<string, PanelConfig> = {
   'windy-webcams': { name: 'Windy Live Webcam', enabled: false, priority: 2 },
   insights: { name: 'AI Market Insights', enabled: true, priority: 1 },
   markets: { name: 'Live Markets', enabled: true, priority: 1 },
-  'stock-analysis': { name: 'Premium Stock Analysis', enabled: true, priority: 1, premium: 'locked' },
-  'stock-backtest': { name: 'Premium Backtesting', enabled: true, priority: 1, premium: 'locked' },
-  'daily-market-brief': { name: 'Daily Market Brief', enabled: true, priority: 1, premium: 'locked' },
   'markets-news': { name: 'Markets News', enabled: true, priority: 2 },
   forex: { name: 'Forex & Currencies', enabled: true, priority: 1 },
   bonds: { name: 'Fixed Income', enabled: true, priority: 1 },
@@ -464,8 +448,6 @@ const FINANCE_PANELS: Record<string, PanelConfig> = {
   'other-tokens': { name: 'Alt Tokens', enabled: true, priority: 2 },
   centralbanks: { name: 'Central Bank Watch', enabled: true, priority: 1 },
   economic: { name: 'Macro Stress', enabled: true, priority: 1 },
-  'global-procurement': { name: 'Global Procurement', enabled: true, priority: 1, premium: 'locked' as const },
-  'trade-policy': { name: 'Trade Policy', enabled: true, priority: 1, premium: 'locked' as const },
   'sanctions-pressure': { name: 'Sanctions Pressure', enabled: true, priority: 1 },
   'supply-chain': { name: 'Supply Chain', enabled: true, priority: 1 },
   'economic-news': { name: 'Economic News', enabled: true, priority: 2 },
@@ -496,11 +478,9 @@ const FINANCE_PANELS: Record<string, PanelConfig> = {
   'gulf-economies': { name: 'Gulf Economies', enabled: true, priority: 1 },
   'consumer-prices': { name: 'Consumer Prices', enabled: true, priority: 1 },
   polymarket: { name: 'Predictions', enabled: true, priority: 2 },
-  'wsb-ticker-scanner': { name: 'WSB Ticker Scanner', enabled: true, priority: 75, premium: 'locked' },
   'airline-intel': { name: 'Airline Intelligence', enabled: true, priority: 2 },
   'world-clock': { name: 'World Clock', enabled: true, priority: 2 },
   monitors: { name: 'My Monitors', enabled: true, priority: 2 },
-  'latest-brief': { name: 'Latest Brief', enabled: true, priority: 1, premium: 'locked' as const },
 };
 
 const FINANCE_MAP_LAYERS: MapLayers = {
@@ -797,7 +777,6 @@ const COMMODITY_PANELS: Record<string, PanelConfig> = {
   'gold-intelligence': { name: 'Gold Intelligence', enabled: true, priority: 60 },
   heatmap: { name: 'Sector Heatmap', enabled: true, priority: 1 },
   'macro-signals': { name: 'Market Regime', enabled: true, priority: 1 },
-  'trade-policy': { name: 'Trade Policy', enabled: true, priority: 1, premium: 'locked' as const },
   'sanctions-pressure': { name: 'Sanctions Pressure', enabled: true, priority: 1 },
   economic: { name: 'Macro Stress', enabled: true, priority: 1 },
   'gulf-economies': { name: 'Gulf & OPEC Economies', enabled: true, priority: 1 },
@@ -807,7 +786,6 @@ const COMMODITY_PANELS: Record<string, PanelConfig> = {
   polymarket: { name: 'Commodity Predictions', enabled: true, priority: 2 },
   'world-clock': { name: 'World Clock', enabled: true, priority: 2 },
   monitors: { name: 'My Monitors', enabled: true, priority: 2 },
-  'latest-brief': { name: 'Latest Brief', enabled: true, priority: 1, premium: 'locked' as const },
 };
 
 const COMMODITY_MAP_LAYERS: MapLayers = {
@@ -971,7 +949,6 @@ const ENERGY_PANELS: Record<string, PanelConfig> = {
   // Tracking
   monitors: { name: 'My Monitors', enabled: true, priority: 3 },
   'world-clock': { name: 'World Clock', enabled: true, priority: 3 },
-  'latest-brief': { name: 'Latest Brief', enabled: true, priority: 1, premium: 'locked' as const },
 };
 
 const ENERGY_MAP_LAYERS: MapLayers = {
