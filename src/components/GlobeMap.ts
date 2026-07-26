@@ -23,7 +23,7 @@ import { NUCLEAR_FACILITIES, SPACEPORTS, ECONOMIC_CENTERS, CRITICAL_MINERALS, UN
 import { PIPELINES } from '@/config/pipelines';
 import { t } from '@/services/i18n';
 import { SITE_VARIANT } from '@/config/variant';
-import { getGlobeRenderScale, resolveGlobePixelRatio, resolvePerformanceProfile, subscribeGlobeRenderScaleChange, getGlobeTexture, GLOBE_TEXTURE_URLS, subscribeGlobeTextureChange, getGlobeVisualPreset, subscribeGlobeVisualPresetChange, type GlobeRenderScale, type GlobePerformanceProfile, type GlobeVisualPreset } from '@/services/globe-render-settings';
+import { getGlobeRenderScale, resolveGlobePixelRatio, resolvePerformanceProfile, subscribeGlobeRenderScaleChange, getGlobeTexture, GLOBE_TEXTURE_URLS, subscribeGlobeTextureChange, getGlobeVisualPreset, subscribeGlobeVisualPresetChange, nasaBlueMarbleTileUrl, NASA_GIBS_MAX_LEVEL, type GlobeRenderScale, type GlobePerformanceProfile, type GlobeVisualPreset, type GlobeTexture } from '@/services/globe-render-settings';
 import {
   getLayerExplanation,
   getLayersForVariant,
@@ -691,6 +691,9 @@ export class GlobeMap {
       .width(initW)
       .height(initH)
       .pathTransitionDuration(0);
+    if (initialTexture === 'nasa-tiled') {
+      globe.globeTileEngineUrl(nasaBlueMarbleTileUrl).globeTileEngineMaxLevel(NASA_GIBS_MAX_LEVEL);
+    }
 
     // Orbit controls — match Sentinel's settings
     const controls = globe.controls() as GlobeControlsLike;
@@ -727,7 +730,7 @@ export class GlobeMap {
     // Globe attribution (texture + OpenStreetMap data)
     const attribution = document.createElement('div');
     attribution.className = 'map-attribution';
-    setTrustedHtml(attribution, trustedHtml('© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> © <a href="https://www.naturalearthdata.com" target="_blank" rel="noopener">Natural Earth</a>', "legacy direct innerHTML migration"));
+    setTrustedHtml(attribution, trustedHtml('© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> © <a href="https://www.naturalearthdata.com" target="_blank" rel="noopener">Natural Earth</a> · Imagery: <a href="https://earthdata.nasa.gov/gibs" target="_blank" rel="noopener">NASA EOSDIS GIBS / Blue Marble</a>', "legacy direct innerHTML migration"));
     this.container.appendChild(attribution);
 
     // Upgrade material to MeshStandardMaterial + add scene enhancements
@@ -744,9 +747,9 @@ export class GlobeMap {
       this.applyVisualPreset(preset);
     });
 
-    // Subscribe to texture changes (kept as-is)
+    // Subscribe to texture changes
     this.unsubscribeGlobeTexture = subscribeGlobeTextureChange((texture) => {
-      if (this.globe) this.globe.globeImageUrl(GLOBE_TEXTURE_URLS[texture]);
+      this.applyGlobeTexture(texture);
     });
 
     const canvas = this.container.querySelector('canvas');
@@ -3664,6 +3667,26 @@ export class GlobeMap {
       this.applyEnhancedVisuals();
     } else {
       this.removeEnhancedVisuals();
+    }
+  }
+
+  // 'nasa-tiled' hands the whole globe render over to three-globe's tile
+  // engine (loading NASA GIBS Blue Marble tiles at the zoom-appropriate
+  // resolution -- a static image can't be sharp enough for close inspection
+  // and still fit in GPU texture memory as one piece). The other two modes
+  // are a single static image, same as before.
+  private applyGlobeTexture(texture: GlobeTexture): void {
+    if (!this.globe) return;
+    this.globe.globeImageUrl(GLOBE_TEXTURE_URLS[texture]);
+    if (texture === 'nasa-tiled') {
+      this.globe.globeTileEngineUrl(nasaBlueMarbleTileUrl).globeTileEngineMaxLevel(NASA_GIBS_MAX_LEVEL);
+    } else {
+      // three-globe treats a falsy globeTileEngineUrl as "tile engine off,
+      // show the static globeImageUrl instead" -- confirmed against its
+      // source, but its public types only declare the function-argument
+      // overload, not this (valid, documented-by-example) disable path.
+      (this.globe.globeTileEngineUrl as (fn: undefined) => unknown)(undefined);
+      this.globe.globeTileEngineClearCache();
     }
   }
 

@@ -2,7 +2,7 @@ import { LANGUAGES, getCurrentLanguage, changeLanguage, t } from '@/services/i18
 import { getAiFlowSettings, setAiFlowSetting, getStreamQuality, setStreamQuality, STREAM_QUALITY_OPTIONS } from '@/services/ai-flow-settings';
 import { getMapProvider, setMapProvider, MAP_PROVIDER_OPTIONS, MAP_THEME_OPTIONS, getMapTheme, setMapTheme, type MapProvider } from '@/config/basemap';
 import { getLiveStreamsAlwaysOn, setLiveStreamsAlwaysOn } from '@/services/live-stream-settings';
-import { getGlobeVisualPreset, setGlobeVisualPreset, GLOBE_VISUAL_PRESET_OPTIONS, type GlobeVisualPreset } from '@/services/globe-render-settings';
+import { getGlobeVisualPreset, setGlobeVisualPreset, GLOBE_VISUAL_PRESET_OPTIONS, type GlobeVisualPreset, getGlobeTexture, setGlobeTexture, GLOBE_TEXTURE_OPTIONS, type GlobeTexture } from '@/services/globe-render-settings';
 import type { StreamQuality } from '@/services/ai-flow-settings';
 import { getThemePreference, setThemePreference, type ThemePreference } from '@/utils/theme-manager';
 import { getFontFamily, setFontFamily, type FontFamily } from '@/services/font-settings';
@@ -199,6 +199,24 @@ export function renderPreferences(host: PreferencesHost): PreferencesResult {
   html += `<select class="unified-settings-select" id="us-globe-visual-preset">`;
   for (const opt of GLOBE_VISUAL_PRESET_OPTIONS) {
     const selected = opt.value === currentPreset ? ' selected' : '';
+    html += `<option value="${opt.value}"${selected}>${escapeHtml(opt.label)}</option>`;
+  }
+  html += `</select>`;
+
+  // 3D Globe texture (Blue Marble/topographic static image, or NASA GIBS
+  // tiles streamed in at the zoom-appropriate resolution -- sharper up
+  // close than any single static image, since GPU texture memory can't
+  // hold a whole-planet image sharp enough for close inspection anyway).
+  const currentTexture = getGlobeTexture();
+  html += `<div class="ai-flow-toggle-row">
+    <div class="ai-flow-toggle-label-wrap">
+      <div class="ai-flow-toggle-label">Globe texture</div>
+      <div class="ai-flow-toggle-desc">NASA HD Tiles loads sharper imagery as you zoom in, streamed from NASA GIBS (Blue Marble Next Generation); no coverage above/below ~85° latitude, where it falls back to the static texture.</div>
+    </div>
+  </div>`;
+  html += `<select class="unified-settings-select" id="us-globe-texture">`;
+  for (const opt of GLOBE_TEXTURE_OPTIONS) {
+    const selected = opt.value === currentTexture ? ' selected' : '';
     html += `<option value="${opt.value}"${selected}>${escapeHtml(opt.label)}</option>`;
   }
   html += `</select>`;
@@ -428,6 +446,10 @@ export function renderPreferences(host: PreferencesHost): PreferencesResult {
         }
         if (target.id === 'us-globe-visual-preset') {
           setGlobeVisualPreset(target.value as GlobeVisualPreset);
+          return;
+        }
+        if (target.id === 'us-globe-texture') {
+          setGlobeTexture(target.value as GlobeTexture);
           return;
         }
         if (target.id === 'us-theme') {

@@ -1,5 +1,5 @@
 export type GlobeRenderScale = 'auto' | '1' | '1.5' | '2' | '3';
-export type GlobeTexture = 'topographic' | 'blue-marble';
+export type GlobeTexture = 'topographic' | 'blue-marble' | 'nasa-tiled';
 
 const STORAGE_KEY = 'wm-globe-render-scale';
 const EVENT_NAME = 'wm-globe-render-scale-changed';
@@ -77,17 +77,35 @@ export function resolvePerformanceProfile(scale: GlobeRenderScale): GlobePerform
 export const GLOBE_TEXTURE_OPTIONS: { value: GlobeTexture; label: string }[] = [
   { value: 'topographic', label: 'Topographic' },
   { value: 'blue-marble', label: 'Blue Marble (NASA)' },
+  { value: 'nasa-tiled', label: 'NASA HD Tiles' },
 ];
 
+// Static, single-image fallback shown immediately (and used at all times
+// for the two non-tiled options). For 'nasa-tiled' this is what's visible
+// before the first tiles have streamed in, and at the poles, where GIBS'
+// Web Mercator tile grid has no coverage above/below roughly +/-85 degrees.
 export const GLOBE_TEXTURE_URLS: Record<GlobeTexture, string> = {
   'topographic': '/textures/earth-topo-bathy.jpg',
   'blue-marble': '/textures/earth-blue-marble.jpg',
+  'nasa-tiled': '/textures/earth-blue-marble.jpg',
 };
+
+// NASA GIBS' Blue Marble Next Generation layer, Web Mercator tile grid,
+// capped at its native max zoom (verified: level 8 tiles resolve, e.g.
+// https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_NextGeneration/default/GoogleMapsCompatible_Level8/8/120/128.jpeg).
+// "GoogleMapsCompatible_Level8" names GIBS' tile-matrix-SET (this layer's
+// available resolution ceiling); the leading path segment after it is the
+// actual requested zoom level, which is a *different* number from 0-8.
+export const NASA_GIBS_MAX_LEVEL = 8;
+
+export function nasaBlueMarbleTileUrl(x: number, y: number, level: number): string {
+  return `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_NextGeneration/default/GoogleMapsCompatible_Level8/${level}/${y}/${x}.jpeg`;
+}
 
 export function getGlobeTexture(): GlobeTexture {
   try {
     const raw = localStorage.getItem(TEXTURE_STORAGE_KEY);
-    if (raw === 'topographic' || raw === 'blue-marble') return raw;
+    if (raw === 'topographic' || raw === 'blue-marble' || raw === 'nasa-tiled') return raw;
   } catch { /* ignore */ }
   return 'topographic';
 }
