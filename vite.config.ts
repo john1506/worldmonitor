@@ -108,6 +108,7 @@ const PANEL_CLUSTER: Record<string, PanelChunkName> = {
   StorageFacilityMap: 'panels-energy', RenewableEnergy: 'panels-energy',
   // Defense / military / aviation
   AirlineIntel: 'panels-defense', DefensePatents: 'panels-defense',
+  ImageryWatch: 'panels-defense',
   OrefSirens: 'panels-defense', StrategicPosture: 'panels-defense',
   StrategicRisk: 'panels-defense', ThermalEscalation: 'panels-defense',
   UcdpEvents: 'panels-defense',

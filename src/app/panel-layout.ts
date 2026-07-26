@@ -2039,6 +2039,12 @@ export class PanelLayoutManager implements AppModule {
       return panel;
     });
 
+    this.lazyImportedPanel('imagery-watch', () => import('@/components/ImageryWatchPanel'), 'ImageryWatchPanel', (ImageryWatchPanel) => {
+      const panel = new ImageryWatchPanel();
+      panel.setGetMapCenterHandler(() => this.ctx.map?.getCenter() ?? null);
+      return panel;
+    });
+
     this.lazyPanel('gulf-economies', () =>
       this.importPanel('gulf-economies', () => import('@/components/GulfEconomiesPanel'), 'GulfEconomiesPanel', (GulfEconomiesPanel) => new GulfEconomiesPanel()),
     );
