@@ -677,7 +677,7 @@ export class SearchManager implements AppModule {
   }
 
   updateFlightSource(adsb: PositionSample[], military: MilitaryFlight[]): void {
-    if (!this.ctx.searchModal || !isProUser()) return;
+    if (!this.ctx.searchModal) return;
     const items = [
       ...adsb.map(p => {
         const fl = Number.isFinite(p.altitudeFt) ? Math.round(p.altitudeFt / 100) : null;
