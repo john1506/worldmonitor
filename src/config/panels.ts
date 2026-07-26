@@ -1169,8 +1169,8 @@ export function isPanelInVariantDefaults(key: string): boolean {
   return (VARIANT_DEFAULTS[SITE_VARIANT] ?? []).includes(key);
 }
 
-export const FREE_MAX_PANELS = 40;
-export const FREE_MAX_SOURCES = 80;
+export const FREE_MAX_PANELS = Infinity;
+export const FREE_MAX_SOURCES = Infinity;
 
 export function isFreePanelCapCounted(key: string): boolean {
   return key !== 'map' && !key.startsWith('cw-');
