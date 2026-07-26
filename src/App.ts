@@ -842,6 +842,44 @@ export class App {
         localStorage.setItem(PANEL_PRUNE_KEY, 'done');
       }
 
+      // One-time migration: prune panel keys removed by the vanilla-client
+      // patch (stock-analysis, stock-backtest, daily-market-brief,
+      // chat-analyst, global-procurement, trade-policy, latest-brief,
+      // wsb-ticker-scanner, market-implications, regional-intelligence,
+      // deduction). worldmonitor-panel-prune-v1 above only runs ONCE ever
+      // per browser -- for anyone who already had it fire (on any earlier
+      // version, for unrelated reasons), it will never run again, so their
+      // now-orphaned saved panelSettings entries for these 11 keys keep
+      // rendering with the stale premium:'locked' flag baked into the saved
+      // object forever, even though ALL_PANELS no longer offers them.
+      // Distinct key so this always fires once regardless of prune-v1's
+      // history. Reuses the exact same logic against the current ALL_PANELS
+      // (which already excludes these keys), so it's a no-op for anyone who
+      // never had them enabled.
+      const VANILLA_PANEL_PRUNE_KEY = 'worldmonitor-vanilla-panel-prune-v1';
+      if (!localStorage.getItem(VANILLA_PANEL_PRUNE_KEY)) {
+        const validKeys = new Set(Object.keys(ALL_PANELS));
+        let pruned = false;
+        for (const key of Object.keys(panelSettings)) {
+          if (!validKeys.has(key) && key !== 'runtime-config') {
+            delete panelSettings[key];
+            pruned = true;
+          }
+        }
+        if (pruned) saveToStorage(STORAGE_KEYS.panels, panelSettings);
+        for (const orderKey of [PANEL_ORDER_KEY, PANEL_ORDER_KEY + '-bottom-set', PANEL_ORDER_KEY + '-bottom']) {
+          try {
+            const raw = localStorage.getItem(orderKey);
+            if (!raw) continue;
+            const arr = JSON.parse(raw);
+            if (!Array.isArray(arr)) continue;
+            const filtered = arr.filter((k: string) => validKeys.has(k));
+            if (filtered.length !== arr.length) localStorage.setItem(orderKey, JSON.stringify(filtered));
+          } catch { localStorage.removeItem(orderKey); }
+        }
+        localStorage.setItem(VANILLA_PANEL_PRUNE_KEY, 'done');
+      }
+
       // One-time migration: clear stale panel ordering and sizing state
       const LAYOUT_RESET_MIGRATION_KEY = 'worldmonitor-layout-reset-v2.5';
       if (!localStorage.getItem(LAYOUT_RESET_MIGRATION_KEY)) {
