@@ -594,6 +594,7 @@ export class GlobeMap {
   // without the globe drifting back into motion on its own.
   private rotationLocked = localStorage.getItem('wm-globe-rotation-locked') === '1';
   private rotationLockBtn: HTMLButtonElement | null = null;
+  private attributionEl: HTMLElement | null = null;
 
   // Overlay UI elements
   private layerTogglesEl: HTMLElement | null = null;
@@ -727,11 +728,13 @@ export class GlobeMap {
         'position:absolute;top:0;left:0;width:100% !important;height:100% !important;';
     }
 
-    // Globe attribution (texture + OpenStreetMap data)
+    // Globe attribution (OSM data, which is texture-independent, + whichever
+    // imagery credit matches the currently selected globe texture).
     const attribution = document.createElement('div');
     attribution.className = 'map-attribution';
-    setTrustedHtml(attribution, trustedHtml('© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> © <a href="https://www.naturalearthdata.com" target="_blank" rel="noopener">Natural Earth</a> · Imagery: <a href="https://earthdata.nasa.gov/gibs" target="_blank" rel="noopener">NASA EOSDIS GIBS / Blue Marble</a>', "legacy direct innerHTML migration"));
+    setTrustedHtml(attribution, trustedHtml(GlobeMap.attributionHtml(initialTexture), "legacy direct innerHTML migration"));
     this.container.appendChild(attribution);
+    this.attributionEl = attribution;
 
     // Upgrade material to MeshStandardMaterial + add scene enhancements
     // Save default material for classic preset restoration
@@ -3688,6 +3691,22 @@ export class GlobeMap {
       (this.globe.globeTileEngineUrl as (fn: undefined) => unknown)(undefined);
       this.globe.globeTileEngineClearCache();
     }
+    if (this.attributionEl) {
+      setTrustedHtml(this.attributionEl, trustedHtml(GlobeMap.attributionHtml(texture), "legacy direct innerHTML migration"));
+    }
+  }
+
+  // OSM attribution covers country border/label data drawn on the globe
+  // regardless of which base texture is selected; the imagery credit is
+  // the part that actually depends on the chosen texture.
+  private static attributionHtml(texture: GlobeTexture): string {
+    const osm = '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
+    const imageryCredit = texture === 'nasa-tiled'
+      ? 'Imagery: <a href="https://earthdata.nasa.gov/gibs" target="_blank" rel="noopener">NASA EOSDIS GIBS / Blue Marble</a>'
+      : texture === 'blue-marble'
+      ? 'Imagery: <a href="https://visibleearth.nasa.gov/collection/1484/blue-marble" target="_blank" rel="noopener">NASA Blue Marble</a>'
+      : '© <a href="https://www.naturalearthdata.com" target="_blank" rel="noopener">Natural Earth</a>';
+    return `${osm} ${imageryCredit}`;
   }
 
   // ─── Render quality & performance profile ────────────────────────────────
