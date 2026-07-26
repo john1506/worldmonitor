@@ -3,6 +3,8 @@ import { toApiUrl } from '@/services/runtime';
 import { showToast } from '@/utils/toast';
 import { h, clearChildren } from '@/utils/dom-utils';
 import { escapeHtml } from '@/utils/sanitize';
+import { ImageryCogViewer } from './ImageryCogViewer';
+import { fetchUcdpEvents } from '@/services/conflict';
 
 interface ImageryArea {
   id: string;
@@ -32,9 +34,19 @@ interface ImageryEvent {
   source: string;
 }
 
+interface AreaSuggestion {
+  name: string;
+  lat: number;
+  lon: number;
+  deaths: number;
+}
+
 const LAST_SEEN_CURSOR_KEY = 'wm-imagery-watch-last-seen-cursor';
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // events endpoint is a cheap Redis LRANGE, fine to poll often
 const EARTH_DEG_KM = 111; // rough km-per-degree, fine for area-of-interest bboxes (not survey-grade)
+const SUGGESTION_WINDOW_DAYS = 60;
+const SUGGESTION_COUNT = 5;
+const SUGGESTION_RADIUS_KM = 50; // country/region-level cluster, wider than the manual-pin default
 
 function bboxFromCenter(lat: number, lon: number, radiusKm: number): [number, number, number, number] {
   const dLat = radiusKm / EARTH_DEG_KM;
@@ -52,6 +64,11 @@ export class ImageryWatchPanel extends Panel {
   private getMapCenter: (() => { lat: number; lon: number } | null) | null = null;
   private addFormOpen = false;
   private pendingCenter: { lat: number; lon: number } | null = null;
+  private pendingName = '';
+  private pendingRadiusKm = 15;
+  private cogViewer = new ImageryCogViewer();
+  private suggestions: AreaSuggestion[] = [];
+  private suggestionsLoaded = false;
 
   constructor() {
     super({ id: 'imagery-watch', title: 'Imagery Watch', infoTooltip: 'Subscribe to an area and get notified when new free satellite imagery (Sentinel-2, and NAIP for US locations) is captured there.' });
@@ -132,6 +149,43 @@ export class ImageryWatchPanel extends Panel {
     }
   }
 
+  private async loadSuggestions(): Promise<void> {
+    if (this.suggestionsLoaded) return;
+    this.suggestionsLoaded = true;
+    try {
+      const resp = await fetchUcdpEvents();
+      if (!resp.success) return;
+      const cutoff = Date.now() - SUGGESTION_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+      const recent = resp.data.filter((e) => Date.parse(e.date_start) >= cutoff && Number.isFinite(e.latitude) && Number.isFinite(e.longitude));
+
+      // Coarse country-level clustering: sum severity per country, suggest
+      // the most recent event's coordinates within that country as the
+      // representative center. Simple and cheap -- a real geo-clustering
+      // pass would be more precise but isn't needed for "here's roughly
+      // where things are active right now" suggestions.
+      const byCountry = new Map<string, { deaths: number; latest: typeof recent[number] }>();
+      for (const event of recent) {
+        const existing = byCountry.get(event.country);
+        const deaths = (existing?.deaths ?? 0) + (event.deaths_best || 0);
+        const latest = !existing || Date.parse(event.date_start) > Date.parse(existing.latest.date_start) ? event : existing.latest;
+        byCountry.set(event.country, { deaths, latest });
+      }
+
+      this.suggestions = [...byCountry.entries()]
+        .sort((a, b) => b[1].deaths - a[1].deaths)
+        .slice(0, SUGGESTION_COUNT)
+        .map(([country, { deaths, latest }]) => ({
+          name: country,
+          lat: latest.latitude,
+          lon: latest.longitude,
+          deaths,
+        }));
+      if (this.addFormOpen) this.render();
+    } catch {
+      // Suggestions are a nice-to-have; silently skip on failure.
+    }
+  }
+
   private async loadHistory(areaId: string): Promise<void> {
     try {
       const resp = await fetch(toApiUrl(`/api/imagery-watch/v1/history?areaId=${encodeURIComponent(areaId)}`), { signal: AbortSignal.timeout(10_000) });
@@ -144,13 +198,13 @@ export class ImageryWatchPanel extends Panel {
     }
   }
 
-  private async addArea(name: string, center: { lat: number; lon: number }, radiusKm: number): Promise<void> {
+  private async addArea(name: string, center: { lat: number; lon: number }, radiusKm: number, notifyHa: boolean, storeHighRes: boolean): Promise<void> {
     const bbox = bboxFromCenter(center.lat, center.lon, radiusKm);
     try {
       const resp = await fetch(toApiUrl('/api/imagery-watch/v1/areas'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, bbox }),
+        body: JSON.stringify({ name, bbox, notifyHa, storeHighRes }),
         signal: AbortSignal.timeout(15_000),
       });
       if (!resp.ok) {
@@ -159,6 +213,9 @@ export class ImageryWatchPanel extends Panel {
       }
       showToast(`Now watching "${name}"`);
       this.addFormOpen = false;
+      this.pendingName = '';
+      this.pendingRadiusKm = 15;
+      this.pendingCenter = null;
       await this.loadAreas();
     } catch {
       showToast('Could not add area -- try again in a moment.');
@@ -183,7 +240,11 @@ export class ImageryWatchPanel extends Panel {
       h('span', { className: 'imagery-watch-unread-badge', style: { display: this.unreadCount > 0 ? '' : 'none' } }, String(this.unreadCount)),
       h('button', {
         className: 'btn btn-secondary imagery-watch-add-btn',
-        onClick: () => { this.addFormOpen = !this.addFormOpen; this.render(); },
+        onClick: () => {
+          this.addFormOpen = !this.addFormOpen;
+          if (this.addFormOpen) void this.loadSuggestions();
+          this.render();
+        },
       }, this.addFormOpen ? 'Cancel' : '+ Add area'),
     );
     this.content.appendChild(header);
@@ -244,11 +305,41 @@ export class ImageryWatchPanel extends Panel {
   private renderAddForm(): HTMLElement {
     const center = this.pendingCenter ?? this.getMapCenter?.() ?? null;
 
-    const nameInput = h('input', { type: 'text', className: 'imagery-watch-name-input', placeholder: 'Area name (e.g. Kharkiv)', maxlength: '80' }) as HTMLInputElement;
-    const radiusInput = h('input', { type: 'number', className: 'imagery-watch-radius-input', value: '15', min: '1', max: '200' }) as HTMLInputElement;
+    // Backed by pendingName/pendingRadiusKm (not just the input's own DOM
+    // value) so a suggestion-chip click or "use current map view" click --
+    // both of which re-render this whole form -- don't wipe out whatever
+    // the user already typed/picked.
+    const nameInput = h('input', {
+      type: 'text', className: 'imagery-watch-name-input', placeholder: 'Area name (e.g. Kharkiv)', maxlength: '80',
+      value: this.pendingName,
+      onInput: (e: Event) => { this.pendingName = (e.target as HTMLInputElement).value; },
+    }) as HTMLInputElement;
+    const radiusInput = h('input', {
+      type: 'number', className: 'imagery-watch-radius-input', min: '1', max: '200',
+      value: String(this.pendingRadiusKm),
+      onInput: (e: Event) => { this.pendingRadiusKm = Math.max(1, Number((e.target as HTMLInputElement).value) || 15); },
+    }) as HTMLInputElement;
+    const notifyHaInput = h('input', { type: 'checkbox', id: 'imagery-watch-notify-ha' }) as HTMLInputElement;
+    const storeHighResInput = h('input', { type: 'checkbox', id: 'imagery-watch-store-highres' }) as HTMLInputElement;
 
     return h('div', { className: 'imagery-watch-add-form' },
       nameInput,
+      ...(this.suggestions.length > 0 ? [
+        h('div', { className: 'imagery-watch-suggestions-label' }, 'Suggested (active conflict zones, last 60 days):'),
+        h('div', { className: 'imagery-watch-suggestions' },
+          ...this.suggestions.map((s) =>
+            h('button', {
+              className: 'imagery-watch-suggestion-chip',
+              onClick: () => {
+                this.pendingName = s.name;
+                this.pendingRadiusKm = SUGGESTION_RADIUS_KM;
+                this.pendingCenter = { lat: s.lat, lon: s.lon };
+                this.render();
+              },
+            }, s.name),
+          ),
+        ),
+      ] : []),
       h('div', { className: 'imagery-watch-add-form-row' },
         h('button', {
           className: 'btn btn-secondary',
@@ -260,6 +351,14 @@ export class ImageryWatchPanel extends Panel {
         h('span', {}, 'radius (km)'),
         radiusInput,
       ),
+      h('label', { className: 'imagery-watch-add-form-checkbox' },
+        notifyHaInput,
+        ' Also notify via Home Assistant (needs the add-on\'s Home Assistant API permission, approved on install/update)',
+      ),
+      h('label', { className: 'imagery-watch-add-form-checkbox' },
+        storeHighResInput,
+        ' Keep a local copy of imagery for this area (survives even if it ages out of the free source -- uses disk space)',
+      ),
       h('button', {
         className: 'btn btn-primary',
         onClick: () => {
@@ -270,7 +369,7 @@ export class ImageryWatchPanel extends Panel {
             showToast(!name ? 'Give the area a name.' : 'Pan the map to the area first, then click "Use current map view".');
             return;
           }
-          void this.addArea(name, useCenter, radiusKm);
+          void this.addArea(name, useCenter, radiusKm, notifyHaInput.checked, storeHighResInput.checked);
         },
       }, 'Start watching'),
     );
@@ -282,12 +381,14 @@ export class ImageryWatchPanel extends Panel {
     }
     return h('div', { className: 'imagery-watch-history' },
       ...history.map((scene) =>
-        h('a', {
+        h('button', {
           className: 'imagery-watch-history-item',
-          href: scene.assetUrl || scene.previewUrl,
-          target: '_blank',
-          rel: 'noopener',
-          title: `${scene.satellite} · ${scene.resolutionM}m/px · ${new Date(scene.datetime).toLocaleString()}`,
+          title: `${scene.satellite} · ${scene.resolutionM}m/px · ${new Date(scene.datetime).toLocaleString()} -- click to open full resolution`,
+          onClick: () => {
+            if (scene.assetUrl || scene.previewUrl) {
+              this.cogViewer.open(scene);
+            }
+          },
         },
           scene.previewUrl
             ? h('img', { src: scene.previewUrl, loading: 'lazy', alt: '' })
@@ -303,6 +404,7 @@ export class ImageryWatchPanel extends Panel {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.cogViewer.close();
     super.destroy();
   }
 }
