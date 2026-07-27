@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { h, clearChildren } from '@/utils/dom-utils';
 import { getCountriesGeoJson } from '@/services/country-geometry';
 import { fetchUcdpEvents } from '@/services/conflict';
-import { nasaBlueMarbleTileUrl, NASA_GIBS_MAX_LEVEL } from '@/services/globe-render-settings';
+import { nasaBlueMarbleTileUrl, nasaCityLightsTileUrl, NASA_GIBS_MAX_LEVEL } from '@/services/globe-render-settings';
 import { fetchEarthquakes } from '@/services/earthquakes';
 import { fetchGpsInterference } from '@/services/gps-interference';
 import type { GpsJamHex } from '@/services/gps-interference';
@@ -14,6 +14,8 @@ import { NUCLEAR_FACILITIES, SPACEPORTS, CRITICAL_MINERALS, ECONOMIC_CENTERS, UN
 import { GAMMA_IRRADIATORS } from '@/config/irradiators';
 import { MILITARY_BASES } from '@/config/military-bases';
 import { PIPELINES } from '@/config/pipelines';
+import { fetchSatelliteTLEs, initSatRecs, propagatePositions, startPropagationLoop } from '@/services/satellites';
+import type { SatellitePosition } from '@/services/satellites';
 
 // A just-for-fun "Truman Show" view: a flat disc textured with a REAL
 // azimuthal-equidistant reprojection of actual NASA satellite imagery
@@ -57,7 +59,7 @@ const ALL_LAYER_KEYS = [
   'conflicts', 'conflictZones', 'hotspots', 'militaryBases', 'nuclear',
   'irradiators', 'spaceports', 'minerals', 'economic', 'waterways',
   'cables', 'pipelines', 'earthquakes', 'gpsJamming', 'radiationWatch',
-  'sunMoon', 'dayNight',
+  'satellites', 'sunMoon', 'dayNight',
 ] as const;
 
 interface MarkerTooltipDatum {
@@ -196,6 +198,20 @@ function skyPosition(lat: number, lon: number, distance: number): THREE.Vector3 
   return new THREE.Vector3(local.x * horizontalScale, distance * 0.8, -local.y * horizontalScale);
 }
 
+// Unlike the sun/moon (positioned by direction only, at a fixed decorative
+// distance), satellites keep their real horizontal ground-track position
+// (directly above the matching point on the disc, like any other marker)
+// and are just elevated by altitude -- so their movement actually tracks
+// the map underneath as they pass over. Real altitudes span ~400km (ISS-
+// class LEO) to ~36,000km (GEO); mapped into a modest, clamped scene-height
+// range rather than to true scale (which would be absurd against a
+// DISC_RADIUS=50 flat disc regardless).
+function satellitePosition(lat: number, lon: number, altKm: number): THREE.Vector3 {
+  const local = projectLonLatLocal(lon, lat);
+  const height = Math.min(120, 20 + altKm / 400);
+  return new THREE.Vector3(local.x, height, -local.y);
+}
+
 // A grayscale vertical gradient for the wall's alphaMap (three.js reads
 // alphaMap as grayscale luminance, not the canvas's own alpha channel --
 // white = opaque, black = transparent), so the wall fades away into the fog
@@ -218,7 +234,10 @@ function buildWallFadeTexture(): THREE.CanvasTexture {
   return new THREE.CanvasTexture(canvas);
 }
 
-async function fetchAssembledMercatorCanvas(zoom: number): Promise<HTMLCanvasElement> {
+async function fetchAssembledMercatorCanvas(
+  zoom: number,
+  tileUrlFn: (x: number, y: number, level: number) => string = nasaBlueMarbleTileUrl,
+): Promise<HTMLCanvasElement> {
   const tilesPerSide = 2 ** zoom;
   const tileSize = 256;
   const canvas = document.createElement('canvas');
@@ -230,7 +249,7 @@ async function fetchAssembledMercatorCanvas(zoom: number): Promise<HTMLCanvasEle
   const loads: Promise<void>[] = [];
   for (let tx = 0; tx < tilesPerSide; tx++) {
     for (let ty = 0; ty < tilesPerSide; ty++) {
-      const url = nasaBlueMarbleTileUrl(tx, ty, zoom);
+      const url = tileUrlFn(tx, ty, zoom);
       loads.push(new Promise((resolve) => {
         const img = new Image();
         img.crossOrigin = 'anonymous';
@@ -247,6 +266,129 @@ async function fetchAssembledMercatorCanvas(zoom: number): Promise<HTMLCanvasEle
   return canvas;
 }
 
+// In-memory (module-level) cache of the raw assembled Mercator canvases
+// BEFORE reprojection, reused across open/close cycles within the same page
+// load. Deliberately not caching the final built disc texture itself: the
+// day/night shading and sun/moon positions need to reflect whatever time it
+// actually is on each open, so those still get recomputed fresh every time,
+// just reusing this same underlying imagery.
+const tileImageryCache: { zoom: number | null; blueMarble: HTMLCanvasElement | null; cityLights: HTMLCanvasElement | null } = {
+  zoom: null, blueMarble: null, cityLights: null,
+};
+
+// Persisted to IndexedDB (survives a full page reload / new tab, unlike the
+// in-memory cache above) -- these are multi-megabyte images, well past what
+// localStorage/sessionStorage's much smaller quota can reasonably hold, so
+// IndexedDB is the right tool here. 24h TTL: Earth's daytime appearance
+// doesn't meaningfully change day to day for a just-for-fun view like this.
+const TILE_IMAGERY_DB_NAME = 'wm-flat-earth-tiles';
+const TILE_IMAGERY_STORE = 'canvases';
+const TILE_IMAGERY_PERSIST_TTL_MS = 24 * 60 * 60 * 1000;
+
+function openTileImageryDb(): Promise<IDBDatabase | null> {
+  return new Promise((resolve) => {
+    if (!('indexedDB' in window)) { resolve(null); return; }
+    try {
+      const req = indexedDB.open(TILE_IMAGERY_DB_NAME, 1);
+      req.onupgradeneeded = () => { req.result.createObjectStore(TILE_IMAGERY_STORE); };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function loadPersistedCanvas(key: string): Promise<HTMLCanvasElement | null> {
+  try {
+    const db = await openTileImageryDb();
+    if (!db) return null;
+    const entry = await new Promise<{ blob: Blob; savedAt: number } | undefined>((resolve) => {
+      const tx = db.transaction(TILE_IMAGERY_STORE, 'readonly');
+      const req = tx.objectStore(TILE_IMAGERY_STORE).get(key);
+      req.onsuccess = () => resolve(req.result as { blob: Blob; savedAt: number } | undefined);
+      req.onerror = () => resolve(undefined);
+    });
+    db.close();
+    if (!entry || Date.now() - entry.savedAt > TILE_IMAGERY_PERSIST_TTL_MS) return null;
+    const bitmap = await createImageBitmap(entry.blob);
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    canvas.getContext('2d')?.drawImage(bitmap, 0, 0);
+    return canvas;
+  } catch {
+    return null;
+  }
+}
+
+async function savePersistedCanvas(key: string, canvas: HTMLCanvasElement): Promise<void> {
+  try {
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.85));
+    if (!blob) return;
+    const db = await openTileImageryDb();
+    if (!db) return;
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(TILE_IMAGERY_STORE, 'readwrite');
+      tx.objectStore(TILE_IMAGERY_STORE).put({ blob, savedAt: Date.now() }, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+    db.close();
+  } catch {
+    // Best-effort -- a failed save just means the next open re-fetches.
+  }
+}
+
+async function getCachedTileImagery(zoom: number): Promise<{ blueMarble: HTMLCanvasElement | null; cityLights: HTMLCanvasElement | null }> {
+  if (tileImageryCache.zoom === zoom && (tileImageryCache.blueMarble || tileImageryCache.cityLights)) {
+    return { blueMarble: tileImageryCache.blueMarble, cityLights: tileImageryCache.cityLights };
+  }
+
+  const [persistedBlueMarble, persistedCityLights] = await Promise.all([
+    loadPersistedCanvas(`blueMarble-z${zoom}`),
+    loadPersistedCanvas(`cityLights-z${zoom}`),
+  ]);
+  if (persistedBlueMarble || persistedCityLights) {
+    tileImageryCache.zoom = zoom;
+    tileImageryCache.blueMarble = persistedBlueMarble;
+    tileImageryCache.cityLights = persistedCityLights;
+    return { blueMarble: persistedBlueMarble, cityLights: persistedCityLights };
+  }
+
+  const [blueMarble, cityLights] = await Promise.all([
+    fetchAssembledMercatorCanvas(zoom, nasaBlueMarbleTileUrl).catch((err) => {
+      console.warn('[FlatEarthView] failed to load NASA Blue Marble tiles', err);
+      return null;
+    }),
+    fetchAssembledMercatorCanvas(zoom, nasaCityLightsTileUrl).catch((err) => {
+      console.warn('[FlatEarthView] failed to load NASA city-lights tiles', err);
+      return null;
+    }),
+  ]);
+  tileImageryCache.zoom = zoom;
+  tileImageryCache.blueMarble = blueMarble;
+  tileImageryCache.cityLights = cityLights;
+  if (blueMarble) void savePersistedCanvas(`blueMarble-z${zoom}`, blueMarble);
+  if (cityLights) void savePersistedCanvas(`cityLights-z${zoom}`, cityLights);
+  return { blueMarble, cityLights };
+}
+
+// Shared by every place that needs a single pixel out of an assembled Web
+// Mercator canvas, given a lon/lat in radians -- both the main reprojection
+// below and the day/night overlay's city-lights/ocean sampling use this
+// exact same formula, so they can't drift out of sync with each other.
+function sampleMercatorPixel(srcData: ImageData, lonRad: number, latRad: number): [number, number, number] {
+  const sw = srcData.width;
+  const sh = srcData.height;
+  const mercX = ((lonRad + Math.PI) / (2 * Math.PI)) * sw;
+  const mercY = (0.5 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / (2 * Math.PI)) * sh;
+  const sx = Math.max(0, Math.min(sw - 1, Math.round(mercX)));
+  const sy = Math.max(0, Math.min(sh - 1, Math.round(mercY)));
+  const idx = (sy * sw + sx) * 4;
+  return [srcData.data[idx] ?? 0, srcData.data[idx + 1] ?? 0, srcData.data[idx + 2] ?? 0];
+}
+
 // Nearest-neighbor reprojection from the assembled Web Mercator canvas into
 // azimuthal-equidistant space. Latitudes beyond Mercator's valid range (no
 // GIBS coverage there) get a flat icy fill instead -- which conveniently
@@ -258,8 +400,6 @@ function reprojectMercatorToAzimuthal(source: HTMLCanvasElement, outSize: number
   const out = new ImageData(outSize, outSize);
   if (!srcCtx) return out;
   const srcData = srcCtx.getImageData(0, 0, source.width, source.height);
-  const sw = source.width;
-  const sh = source.height;
   const center = outSize / 2;
   const maxLatRad = (MERCATOR_MAX_LAT * Math.PI) / 180;
 
@@ -286,14 +426,10 @@ function reprojectMercatorToAzimuthal(source: HTMLCanvasElement, outSize: number
         continue;
       }
 
-      const mercX = ((lonRad + Math.PI) / (2 * Math.PI)) * sw;
-      const mercY = (0.5 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / (2 * Math.PI)) * sh;
-      const sx = Math.max(0, Math.min(sw - 1, Math.round(mercX)));
-      const sy = Math.max(0, Math.min(sh - 1, Math.round(mercY)));
-      const srcIdx = (sy * sw + sx) * 4;
-      out.data[outIdx] = srcData.data[srcIdx] ?? 0;
-      out.data[outIdx + 1] = srcData.data[srcIdx + 1] ?? 0;
-      out.data[outIdx + 2] = srcData.data[srcIdx + 2] ?? 0;
+      const [r, g, b] = sampleMercatorPixel(srcData, lonRad, latRad);
+      out.data[outIdx] = r;
+      out.data[outIdx + 1] = g;
+      out.data[outIdx + 2] = b;
       out.data[outIdx + 3] = 255;
     }
   }
@@ -354,6 +490,7 @@ export class FlatEarthView {
   // if-chain as more layers get added.
   private layerObjects: Record<string, THREE.Object3D> = {};
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private satelliteStopFn: (() => void) | null = null;
   private layers: Record<string, boolean> = Object.fromEntries(
     ALL_LAYER_KEYS.map((key) => [key, localStorage.getItem(`wm-flat-earth-layer-${key}`) !== '0']),
   );
@@ -408,6 +545,7 @@ export class FlatEarthView {
     document.removeEventListener('keydown', this.handleKeydown);
     if (this.animationFrame != null) cancelAnimationFrame(this.animationFrame);
     if (this.refreshTimer != null) clearInterval(this.refreshTimer);
+    this.satelliteStopFn?.();
     this.resizeObserver?.disconnect();
     this.controls?.dispose();
     this.scene?.traverse((obj) => {
@@ -441,6 +579,7 @@ export class FlatEarthView {
     this.dayNightMesh = null;
     this.layerObjects = {};
     this.refreshTimer = null;
+    this.satelliteStopFn = null;
   }
 
   private async initScene(viewport: HTMLElement, subsolar: { lat: number; lon: number }, sublunar: { lat: number; lon: number }): Promise<void> {
@@ -480,7 +619,13 @@ export class FlatEarthView {
     scene.add(sunLight);
     scene.add(sunLight.target);
 
-    const { texture, geometry } = await this.buildDisc();
+    // Cached in memory across open/close cycles (see getCachedTileImagery) --
+    // reused for both the base disc texture and the day/night overlay's
+    // city-lights/ocean-glint blending below.
+    const tileZoom = Math.min(NASA_TILE_ZOOM, NASA_GIBS_MAX_LEVEL);
+    const { blueMarble: blueMarbleCanvas, cityLights: cityLightsCanvas } = await getCachedTileImagery(tileZoom);
+
+    const { texture, geometry } = await this.buildDisc(blueMarbleCanvas);
     const disc = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ map: texture, roughness: 0.85, metalness: 0.05 }));
     disc.rotation.x = -Math.PI / 2;
     scene.add(disc);
@@ -519,7 +664,7 @@ export class FlatEarthView {
     // day/night maps). A separate, toggleable layer rather than baked into
     // the base imagery texture, so it can be regenerated/toggled cheaply
     // without re-fetching or re-reprojecting the NASA tiles.
-    const dayNightTexture = this.buildDayNightTexture(subsolar);
+    const dayNightTexture = this.buildDayNightTexture(subsolar, sublunar, blueMarbleCanvas, cityLightsCanvas);
     const dayNightMesh = new THREE.Mesh(
       geometry.clone(), // same UV-overridden shape, no need to redo that per-vertex loop
       new THREE.MeshBasicMaterial({ map: dayNightTexture, transparent: true, depthWrite: false }),
@@ -574,10 +719,10 @@ export class FlatEarthView {
 
   // One row per signal type, same set as the 2D/3D map's own Layers panel
   // where a reasonably direct equivalent exists. A few of that panel's
-  // layers are deliberately not here yet -- satellites (needs real-time
-  // SGP4 orbital propagation), webcams, military flights/vessels (feature-
-  // gated + clustering logic) and a handful of other-variant-only layers --
-  // left for a follow-up rather than a rushed, likely-buggy first pass.
+  // layers are deliberately not here yet -- webcams, military flights/
+  // vessels (feature-gated + clustering logic upstream) and a handful of
+  // other-map-variant-only layers -- left for a follow-up rather than a
+  // rushed, likely-buggy first pass.
   private buildLayersPanel(): HTMLElement {
     const rows: Array<{ key: string; label: string }> = [
       { key: 'conflicts', label: '⚔️ Conflict events (live)' },
@@ -595,6 +740,7 @@ export class FlatEarthView {
       { key: 'earthquakes', label: '\u{1F30D} Earthquakes (live)' },
       { key: 'gpsJamming', label: '\u{1F4E1} GPS jamming (live)' },
       { key: 'radiationWatch', label: '☢️ Radiation watch (live)' },
+      { key: 'satellites', label: '\u{1F6F0}️ Satellites (live, animated)' },
       { key: 'sunMoon', label: '☀️ Sun & Moon' },
       { key: 'dayNight', label: '\u{1F317} Day / night shading' },
     ];
@@ -723,6 +869,50 @@ export class FlatEarthView {
       (ctx, toCanvas) => this.drawPaths(ctx, toCanvas, PIPELINES, 'rgba(255, 120, 40, 0.85)'));
     this.addOverlayLayer(scene, geometry, 'conflictZones',
       (ctx, toCanvas) => this.drawConflictZones(ctx, toCanvas));
+
+    void this.loadSatellites(scene);
+  }
+
+  // Real-time SGP4 propagation (satellite.js, already a dependency for the
+  // 3D globe's own satellite layer -- same TLE fetch, same propagation
+  // functions, reused directly here). Unlike the other live layers, this
+  // isn't cache-then-refresh-every-5-minutes: satellites genuinely move, so
+  // marker positions get updated in place every few seconds via
+  // startPropagationLoop, reusing the same mesh per satellite rather than
+  // rebuilding the group each tick.
+  private async loadSatellites(scene: THREE.Scene): Promise<void> {
+    const group = this.makeLayerGroup(scene, 'satellites');
+    try {
+      const tles = await fetchSatelliteTLEs();
+      if (!tles || tles.length === 0) return;
+      const satRecs = await initSatRecs(tles);
+      const meshByNoradId = new Map<string, THREE.Mesh>();
+      const geo = new THREE.SphereGeometry(0.5, 8, 8);
+
+      const render = (positions: SatellitePosition[]): void => {
+        for (const pos of positions) {
+          if (!Number.isFinite(pos.lat) || !Number.isFinite(pos.lng)) continue;
+          const world = satellitePosition(pos.lat, pos.lng, pos.alt);
+          let mesh = meshByNoradId.get(pos.noradId);
+          if (!mesh) {
+            mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x88ddff, emissive: 0x2266aa, emissiveIntensity: 0.8 }));
+            group.add(mesh);
+            this.markerMeshes.push(mesh);
+            meshByNoradId.set(pos.noradId, mesh);
+          }
+          mesh.position.copy(world);
+          this.markerData.set(mesh, {
+            title: pos.name,
+            detail: `${pos.type} · alt ${Math.round(pos.alt)}km · ${pos.velocity.toFixed(1)} km/s`,
+          });
+        }
+      };
+
+      render(propagatePositions(satRecs));
+      this.satelliteStopFn = startPropagationLoop(satRecs, render, 2000);
+    } catch (err) {
+      console.warn('[FlatEarthView] failed to load satellites', err);
+    }
   }
 
   private makeLayerGroup(scene: THREE.Scene, key: string): THREE.Group {
@@ -890,9 +1080,23 @@ export class FlatEarthView {
   }
 
   // Same lon/lat recovery formula as reprojectMercatorToAzimuthal (already
-  // verified correct there -- see its comment on the earlier sign bug), just
-  // producing a darkness alpha instead of sampling imagery.
-  private buildDayNightTexture(subsolar: { lat: number; lon: number }): THREE.CanvasTexture {
+  // verified correct there -- see its comment on the earlier sign bug).
+  // Beyond the base darkening alpha, this also blends in two things:
+  //  - Real NASA VIIRS city-lights imagery on the night side (verified
+  //    real data, not a hand-drawn glow -- see nasaCityLightsTileUrl).
+  //  - A moonlit-sea glint: a soft highlight over ocean-like pixels,
+  //    strongest directly under the moon and fading with its local
+  //    elevation. There's no real per-viewing-angle specular reflection in
+  //    a baked texture like this, so this is a stylistic approximation, not
+  //    a physically exact one -- "ocean" itself is also just a coarse
+  //    color heuristic (dark + blue-dominant) on the Blue Marble imagery,
+  //    not a real land/water mask.
+  private buildDayNightTexture(
+    subsolar: { lat: number; lon: number },
+    sublunar: { lat: number; lon: number },
+    blueMarbleCanvas: HTMLCanvasElement | null,
+    cityLightsCanvas: HTMLCanvasElement | null,
+  ): THREE.CanvasTexture {
     const canvas = document.createElement('canvas');
     canvas.width = TEXTURE_SIZE;
     canvas.height = TEXTURE_SIZE;
@@ -903,6 +1107,11 @@ export class FlatEarthView {
     const center = TEXTURE_SIZE / 2;
     const sunLatRad = (subsolar.lat * Math.PI) / 180;
     const sunLonRad = (subsolar.lon * Math.PI) / 180;
+    const moonLatRad = (sublunar.lat * Math.PI) / 180;
+    const moonLonRad = (sublunar.lon * Math.PI) / 180;
+
+    const blueMarbleData = blueMarbleCanvas?.getContext('2d')?.getImageData(0, 0, blueMarbleCanvas.width, blueMarbleCanvas.height) ?? null;
+    const cityLightsData = cityLightsCanvas?.getContext('2d')?.getImageData(0, 0, cityLightsCanvas.width, cityLightsCanvas.height) ?? null;
 
     for (let oy = 0; oy < TEXTURE_SIZE; oy++) {
       for (let ox = 0; ox < TEXTURE_SIZE; ox++) {
@@ -920,13 +1129,41 @@ export class FlatEarthView {
         const elevDeg = (Math.asin(Math.max(-1, Math.min(1, sinElev))) * 180) / Math.PI;
 
         let alpha: number;
-        if (elevDeg > TWILIGHT_BAND_DEG) alpha = 0;
-        else if (elevDeg < -TWILIGHT_BAND_DEG) alpha = NIGHT_MAX_ALPHA;
-        else alpha = NIGHT_MAX_ALPHA * (1 - (elevDeg + TWILIGHT_BAND_DEG) / (2 * TWILIGHT_BAND_DEG));
+        let nightFactor: number;
+        if (elevDeg > TWILIGHT_BAND_DEG) { alpha = 0; nightFactor = 0; }
+        else if (elevDeg < -TWILIGHT_BAND_DEG) { alpha = NIGHT_MAX_ALPHA; nightFactor = 1; }
+        else { nightFactor = 1 - (elevDeg + TWILIGHT_BAND_DEG) / (2 * TWILIGHT_BAND_DEG); alpha = NIGHT_MAX_ALPHA * nightFactor; }
 
-        imageData.data[idx] = 8;
-        imageData.data[idx + 1] = 12;
-        imageData.data[idx + 2] = 28;
+        let r = 8, g = 12, b = 28;
+
+        if (nightFactor > 0) {
+          if (cityLightsData) {
+            const [cr, cg, cb] = sampleMercatorPixel(cityLightsData, lonRad, latRad);
+            // Only the actually-lit pixels (city clusters) contribute --
+            // VIIRS' own near-black background already reads as ~0,0,0.
+            r += cr * nightFactor;
+            g += cg * 0.75 * nightFactor;
+            b += cb * 0.35 * nightFactor;
+          }
+
+          if (blueMarbleData) {
+            const [br, bg, bb] = sampleMercatorPixel(blueMarbleData, lonRad, latRad);
+            const isOceanish = bb > br * 1.1 && bb > bg * 1.02 && br + bg + bb < 300;
+            if (isOceanish) {
+              const sinMoonElev = Math.sin(latRad) * Math.sin(moonLatRad)
+                + Math.cos(latRad) * Math.cos(moonLatRad) * Math.cos(lonRad - moonLonRad);
+              const moonElevDeg = (Math.asin(Math.max(-1, Math.min(1, sinMoonElev))) * 180) / Math.PI;
+              if (moonElevDeg > 0) {
+                const glint = Math.sin((moonElevDeg * Math.PI) / 180) * nightFactor * 55;
+                r += glint * 0.8; g += glint * 0.9; b += glint;
+              }
+            }
+          }
+        }
+
+        imageData.data[idx] = Math.min(255, r);
+        imageData.data[idx + 1] = Math.min(255, g);
+        imageData.data[idx + 2] = Math.min(255, b);
         imageData.data[idx + 3] = Math.round(alpha * 255);
       }
     }
@@ -936,7 +1173,7 @@ export class FlatEarthView {
     return texture;
   }
 
-  private async buildDisc(): Promise<{ texture: THREE.CanvasTexture; geometry: THREE.CircleGeometry }> {
+  private async buildDisc(blueMarbleCanvas: HTMLCanvasElement | null): Promise<{ texture: THREE.CanvasTexture; geometry: THREE.CircleGeometry }> {
     const geometry = new THREE.CircleGeometry(DISC_RADIUS, 128);
 
     // Override the geometry's UVs from its own real vertex data using the
@@ -973,12 +1210,13 @@ export class FlatEarthView {
       center + (local.y / DISC_RADIUS) * center,
     ];
 
-    try {
-      const mercatorCanvas = await fetchAssembledMercatorCanvas(Math.min(NASA_TILE_ZOOM, NASA_GIBS_MAX_LEVEL));
-      const imageData = reprojectMercatorToAzimuthal(mercatorCanvas, TEXTURE_SIZE);
-      ctx.putImageData(imageData, 0, 0);
-    } catch (err) {
-      console.warn('[FlatEarthView] failed to load/reproject NASA imagery, falling back to a plain background', err);
+    if (blueMarbleCanvas) {
+      try {
+        const imageData = reprojectMercatorToAzimuthal(blueMarbleCanvas, TEXTURE_SIZE);
+        ctx.putImageData(imageData, 0, 0);
+      } catch (err) {
+        console.warn('[FlatEarthView] failed to reproject NASA imagery, falling back to a plain background', err);
+      }
     }
 
     ctx.strokeStyle = 'rgba(140, 200, 255, 0.25)';

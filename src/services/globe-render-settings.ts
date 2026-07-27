@@ -98,8 +98,32 @@ export const GLOBE_TEXTURE_URLS: Record<GlobeTexture, string> = {
 // actual requested zoom level, which is a *different* number from 0-8.
 export const NASA_GIBS_MAX_LEVEL = 8;
 
+// Routed through this add-on's own imagery-relay.mjs (server-side
+// proxy+cache, /api/imagery-watch/v1/nasa-tiles/...) instead of NASA's GIBS
+// service directly -- every browser re-fetching the same fixed ~512-tile
+// grid straight from NASA on every load isn't a great way to treat a free
+// public service, and the server-side cache means it only actually happens
+// once per 24h regardless of how many times any client asks.
+//
+// The build-injected ingress bootstrap (rootfs/build-patches/
+// ingress-api-patch.mjs in the addon repo) only patches window.fetch, not
+// <img src> assignment (which is how these tile URLs get used, in an
+// off-screen Image() for canvas compositing) -- so the ingress prefix has
+// to be detected and prepended here too, mirroring that same bootstrap's
+// logic. If that build patch's detection regex ever changes, this needs to
+// change with it.
+function toIngressAwareApiPath(apiPath: string): string {
+  if (typeof window === 'undefined') return apiPath;
+  const match = window.location.pathname.match(/^(\/api\/hassio_ingress\/[^/]+)\//);
+  return match ? match[1] + apiPath : apiPath;
+}
+
 export function nasaBlueMarbleTileUrl(x: number, y: number, level: number): string {
-  return `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_NextGeneration/default/GoogleMapsCompatible_Level8/${level}/${y}/${x}.jpeg`;
+  return toIngressAwareApiPath(`/api/imagery-watch/v1/nasa-tiles/blue-marble/${level}/${x}/${y}.jpg`);
+}
+
+export function nasaCityLightsTileUrl(x: number, y: number, level: number): string {
+  return toIngressAwareApiPath(`/api/imagery-watch/v1/nasa-tiles/city-lights/${level}/${x}/${y}.jpg`);
 }
 
 export function getGlobeTexture(): GlobeTexture {
