@@ -4,6 +4,16 @@ import { h, clearChildren } from '@/utils/dom-utils';
 import { getCountriesGeoJson } from '@/services/country-geometry';
 import { fetchUcdpEvents } from '@/services/conflict';
 import { nasaBlueMarbleTileUrl, NASA_GIBS_MAX_LEVEL } from '@/services/globe-render-settings';
+import { fetchEarthquakes } from '@/services/earthquakes';
+import { fetchGpsInterference } from '@/services/gps-interference';
+import type { GpsJamHex } from '@/services/gps-interference';
+import { fetchRadiationWatch } from '@/services/radiation';
+import type { RadiationObservation } from '@/services/radiation';
+import { INTEL_HOTSPOTS, STRATEGIC_WATERWAYS, CONFLICT_ZONES } from '@/config/geo';
+import { NUCLEAR_FACILITIES, SPACEPORTS, CRITICAL_MINERALS, ECONOMIC_CENTERS, UNDERSEA_CABLES } from '@/config/geo-map';
+import { GAMMA_IRRADIATORS } from '@/config/irradiators';
+import { MILITARY_BASES } from '@/config/military-bases';
+import { PIPELINES } from '@/config/pipelines';
 
 // A just-for-fun "Truman Show" view: a flat disc textured with a REAL
 // azimuthal-equidistant reprojection of actual NASA satellite imagery
@@ -28,8 +38,9 @@ import { nasaBlueMarbleTileUrl, NASA_GIBS_MAX_LEVEL } from '@/services/globe-ren
 // keep in sync by hand.
 
 const DISC_RADIUS = 50;
-const WALL_HEIGHT = 9;
+const WALL_HEIGHT = 3.5; // was 9 -- read as a giant tower rather than a modest ice ridge
 const WALL_THICKNESS = 2.2;
+const WALL_TAPER = 1.5; // base this much wider than the top -- a sloped profile instead of a sheer vertical cylinder
 const TEXTURE_SIZE = 2048;
 const NASA_TILE_ZOOM = 4; // 16x16 tiles -- 2x oversampled vs. TEXTURE_SIZE, meaningfully sharper than 1:1
 const MERCATOR_MAX_LAT = 85.0511; // Web Mercator/GIBS' standard valid latitude bound
@@ -39,12 +50,19 @@ const MOON_DISTANCE = 150;
 const TWILIGHT_BAND_DEG = 6; // matches real civil-twilight convention
 const NIGHT_MAX_ALPHA = 0.72; // capped, not fully opaque -- imagery stays faintly visible at night
 
-interface ConflictMarkerDatum {
-  country: string;
-  lat: number;
-  lon: number;
-  deathsBest: number;
-  dateStart: string;
+// Every toggleable layer this view knows about -- static reference-data
+// layers (always available, no fetch) plus a handful of live-fetched ones
+// (cached + periodically refreshed, see the caching section below).
+const ALL_LAYER_KEYS = [
+  'conflicts', 'conflictZones', 'hotspots', 'militaryBases', 'nuclear',
+  'irradiators', 'spaceports', 'minerals', 'economic', 'waterways',
+  'cables', 'pipelines', 'earthquakes', 'gpsJamming', 'radiationWatch',
+  'sunMoon', 'dayNight',
+] as const;
+
+interface MarkerTooltipDatum {
+  title: string;
+  detail: string;
 }
 
 // Pre-rotation, geometry-local (x, y) in world-scale units -- the single
@@ -178,6 +196,28 @@ function skyPosition(lat: number, lon: number, distance: number): THREE.Vector3 
   return new THREE.Vector3(local.x * horizontalScale, distance * 0.8, -local.y * horizontalScale);
 }
 
+// A grayscale vertical gradient for the wall's alphaMap (three.js reads
+// alphaMap as grayscale luminance, not the canvas's own alpha channel --
+// white = opaque, black = transparent), so the wall fades away into the fog
+// near its top edge instead of ending in a hard cylindrical rim.
+// CylinderGeometry's V=0 is its bottom, V=1 its top; with the texture's
+// default flipY, canvas row 0 (top of the image) maps to v=1 (wall top).
+function buildWallFadeTexture(): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = 4;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    gradient.addColorStop(0, '#000000'); // canvas top -> wall top -> transparent
+    gradient.addColorStop(0.55, '#666666');
+    gradient.addColorStop(1, '#ffffff'); // canvas bottom -> wall bottom -> opaque
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  return new THREE.CanvasTexture(canvas);
+}
+
 async function fetchAssembledMercatorCanvas(zoom: number): Promise<HTMLCanvasElement> {
   const tilesPerSide = 2 ** zoom;
   const tileSize = 256;
@@ -260,6 +300,41 @@ function reprojectMercatorToAzimuthal(source: HTMLCanvasElement, outSize: number
   return out;
 }
 
+// ─── Live-layer caching ─────────────────────────────────────────────────────
+// Persists each live-fetched layer's data in sessionStorage (survives a page
+// reload within the tab, not just an open/close of the view) so reopening
+// the view -- or a periodic background refresh -- doesn't force a visible
+// re-fetch delay. A refresh only overwrites the cache if it actually
+// succeeds; a failed fetch just leaves the previous good data (and its
+// timestamp) in place rather than blanking the layer out.
+const LIVE_LAYER_CACHE_PREFIX = 'wm-flat-earth-cache-';
+const LIVE_LAYER_CACHE_TTL_MS = 10 * 60 * 1000;
+const LIVE_LAYER_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+
+interface CachedLayerEntry<T> {
+  data: T[];
+  fetchedAt: number;
+}
+
+function loadCachedLayer<T>(key: string): CachedLayerEntry<T> | null {
+  try {
+    const raw = sessionStorage.getItem(LIVE_LAYER_CACHE_PREFIX + key);
+    if (!raw) return null;
+    return JSON.parse(raw) as CachedLayerEntry<T>;
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedLayer<T>(key: string, data: T[]): void {
+  try {
+    sessionStorage.setItem(LIVE_LAYER_CACHE_PREFIX + key, JSON.stringify({ data, fetchedAt: Date.now() }));
+  } catch {
+    // Storage full/unavailable -- the in-memory render from this fetch still
+    // works for the current session, just won't persist across a reload.
+  }
+}
+
 export class FlatEarthView {
   private overlay: HTMLElement | null = null;
   private renderer: THREE.WebGLRenderer | null = null;
@@ -269,20 +344,19 @@ export class FlatEarthView {
   private animationFrame: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private markerMeshes: THREE.Mesh[] = [];
-  private markerData = new WeakMap<THREE.Mesh, ConflictMarkerDatum>();
+  private markerData = new WeakMap<THREE.Mesh, MarkerTooltipDatum>();
   private raycaster = new THREE.Raycaster();
   private tooltipEl: HTMLElement | null = null;
-  private conflictGroup: THREE.Group | null = null;
   private sunMoonGroup: THREE.Group | null = null;
   private dayNightMesh: THREE.Mesh | null = null;
-  // Extensible on purpose -- more signal types (flights, ships, satellites)
-  // can each get their own THREE.Group + a row in this same layers panel
-  // later, following the same pattern as this first one.
-  private layers: Record<string, boolean> = {
-    conflicts: localStorage.getItem('wm-flat-earth-layer-conflicts') !== '0',
-    sunMoon: localStorage.getItem('wm-flat-earth-layer-sunmoon') !== '0',
-    dayNight: localStorage.getItem('wm-flat-earth-layer-daynight') !== '0',
-  };
+  // Every toggleable layer's Object3D, keyed the same as `layers` below --
+  // lets setLayerEnabled() stay a one-line generic toggle instead of a long
+  // if-chain as more layers get added.
+  private layerObjects: Record<string, THREE.Object3D> = {};
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private layers: Record<string, boolean> = Object.fromEntries(
+    ALL_LAYER_KEYS.map((key) => [key, localStorage.getItem(`wm-flat-earth-layer-${key}`) !== '0']),
+  );
 
   public async open(): Promise<void> {
     if (this.overlay) return;
@@ -333,6 +407,7 @@ export class FlatEarthView {
     if (!this.overlay) return;
     document.removeEventListener('keydown', this.handleKeydown);
     if (this.animationFrame != null) cancelAnimationFrame(this.animationFrame);
+    if (this.refreshTimer != null) clearInterval(this.refreshTimer);
     this.resizeObserver?.disconnect();
     this.controls?.dispose();
     this.scene?.traverse((obj) => {
@@ -343,8 +418,10 @@ export class FlatEarthView {
         // Generic check (not just MeshStandardMaterial) -- the day/night
         // overlay and sun/moon markers use MeshBasicMaterial, which also
         // has a `.map` that needs its own explicit disposal (Material.dispose()
-        // doesn't cascade to textures, since a texture can be shared).
+        // doesn't cascade to textures, since a texture can be shared). The
+        // wall's alphaMap (its fade-to-transparent gradient) needs the same.
         if ('map' in mat && mat.map instanceof THREE.Texture) mat.map.dispose();
+        if ('alphaMap' in mat && mat.alphaMap instanceof THREE.Texture) mat.alphaMap.dispose();
         mat.dispose();
       }
     });
@@ -360,9 +437,10 @@ export class FlatEarthView {
     this.resizeObserver = null;
     this.markerMeshes = [];
     this.tooltipEl = null;
-    this.conflictGroup = null;
     this.sunMoonGroup = null;
     this.dayNightMesh = null;
+    this.layerObjects = {};
+    this.refreshTimer = null;
   }
 
   private async initScene(viewport: HTMLElement, subsolar: { lat: number; lon: number }, sublunar: { lat: number; lon: number }): Promise<void> {
@@ -454,15 +532,19 @@ export class FlatEarthView {
 
     // The ice wall -- rises right at the disc's outer rim, exactly where the
     // texture's Antarctica ring (and the polar-fill from Mercator's own
-    // coverage limit) lands, so the illusion continues into 3D.
+    // coverage limit) lands, so the illusion continues into 3D. Tapered
+    // (narrower at the top than the base) and faded via alphaMap near its
+    // top edge, rather than a sheer cylinder with a hard rim -- reads as a
+    // sloped ice ridge instead of a tower.
     const wall = new THREE.Mesh(
       new THREE.CylinderGeometry(
-        DISC_RADIUS + WALL_THICKNESS, DISC_RADIUS + WALL_THICKNESS,
+        DISC_RADIUS + WALL_THICKNESS, DISC_RADIUS + WALL_THICKNESS * WALL_TAPER,
         WALL_HEIGHT, 128, 1, true,
       ),
       new THREE.MeshStandardMaterial({
         color: 0xdcefff, roughness: 0.35, metalness: 0.05,
         emissive: 0x224466, emissiveIntensity: 0.25,
+        alphaMap: buildWallFadeTexture(),
         side: THREE.DoubleSide, transparent: true, opacity: 0.92,
       }),
     );
@@ -474,11 +556,7 @@ export class FlatEarthView {
     this.renderer = renderer;
     this.controls = controls;
 
-    const conflictGroup = new THREE.Group();
-    conflictGroup.visible = this.layers.conflicts !== false;
-    scene.add(conflictGroup);
-    this.conflictGroup = conflictGroup;
-    void this.loadConflictMarkers(conflictGroup);
+    this.initLayers(scene, geometry);
 
     renderer.domElement.addEventListener('click', (e) => this.handleClick(e, renderer, camera));
 
@@ -494,12 +572,29 @@ export class FlatEarthView {
     animate();
   }
 
-  // One row per signal type. Only "conflicts" is wired to real data right
-  // now; more (flights, ships, satellites) can follow the same pattern --
-  // add a THREE.Group, a default in `layers`, and a row here.
+  // One row per signal type, same set as the 2D/3D map's own Layers panel
+  // where a reasonably direct equivalent exists. A few of that panel's
+  // layers are deliberately not here yet -- satellites (needs real-time
+  // SGP4 orbital propagation), webcams, military flights/vessels (feature-
+  // gated + clustering logic) and a handful of other-variant-only layers --
+  // left for a follow-up rather than a rushed, likely-buggy first pass.
   private buildLayersPanel(): HTMLElement {
     const rows: Array<{ key: string; label: string }> = [
-      { key: 'conflicts', label: '⚔️ Conflict events' },
+      { key: 'conflicts', label: '⚔️ Conflict events (live)' },
+      { key: 'conflictZones', label: '\u{1F534} Conflict zones' },
+      { key: 'hotspots', label: '\u{1F3AF} Intel hotspots' },
+      { key: 'militaryBases', label: '\u{1FA96} Military bases' },
+      { key: 'nuclear', label: '☢️ Nuclear facilities' },
+      { key: 'irradiators', label: '☣️ Gamma irradiators' },
+      { key: 'spaceports', label: '\u{1F680} Spaceports' },
+      { key: 'minerals', label: '⛏️ Critical minerals' },
+      { key: 'economic', label: '\u{1F4B9} Economic centers' },
+      { key: 'waterways', label: '\u{1F30A} Strategic waterways' },
+      { key: 'cables', label: '\u{1F50C} Undersea cables' },
+      { key: 'pipelines', label: '\u{1F6E2}️ Pipelines' },
+      { key: 'earthquakes', label: '\u{1F30D} Earthquakes (live)' },
+      { key: 'gpsJamming', label: '\u{1F4E1} GPS jamming (live)' },
+      { key: 'radiationWatch', label: '☢️ Radiation watch (live)' },
       { key: 'sunMoon', label: '☀️ Sun & Moon' },
       { key: 'dayNight', label: '\u{1F317} Day / night shading' },
     ];
@@ -523,15 +618,10 @@ export class FlatEarthView {
   private setLayerEnabled(key: string, enabled: boolean): void {
     this.layers[key] = enabled;
     localStorage.setItem(`wm-flat-earth-layer-${key}`, enabled ? '1' : '0');
-    if (key === 'conflicts' && this.conflictGroup) {
-      this.conflictGroup.visible = enabled;
-    }
-    if (key === 'sunMoon' && this.sunMoonGroup) {
-      this.sunMoonGroup.visible = enabled;
-    }
-    if (key === 'dayNight' && this.dayNightMesh) {
-      this.dayNightMesh.visible = enabled;
-    }
+    const obj = this.layerObjects[key];
+    if (obj) obj.visible = enabled;
+    if (key === 'sunMoon' && this.sunMoonGroup) this.sunMoonGroup.visible = enabled;
+    if (key === 'dayNight' && this.dayNightMesh) this.dayNightMesh.visible = enabled;
   }
 
   private handleResize(viewport: HTMLElement): void {
@@ -544,14 +634,23 @@ export class FlatEarthView {
   }
 
   private handleClick(e: MouseEvent, renderer: THREE.WebGLRenderer, camera: THREE.PerspectiveCamera): void {
-    if (!this.tooltipEl || this.markerMeshes.length === 0 || this.layers.conflicts === false) return;
+    if (!this.tooltipEl || this.markerMeshes.length === 0) return;
     const rect = renderer.domElement.getBoundingClientRect();
     const pointer = new THREE.Vector2(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
       -((e.clientY - rect.top) / rect.height) * 2 + 1,
     );
     this.raycaster.setFromCamera(pointer, camera);
-    const hits = this.raycaster.intersectObjects(this.markerMeshes, false);
+    // Only raycast against markers whose layer is actually visible right
+    // now (and thus clickable) -- a hidden layer's meshes stay in the scene
+    // graph (just group.visible = false), so they'd otherwise still count
+    // as hits.
+    const visibleMarkers = this.markerMeshes.filter((m) => {
+      let obj: THREE.Object3D | null = m;
+      while (obj) { if (!obj.visible) return false; obj = obj.parent; }
+      return true;
+    });
+    const hits = this.raycaster.intersectObjects(visibleMarkers, false);
     const hit = hits[0]?.object;
     const datum = hit instanceof THREE.Mesh ? this.markerData.get(hit) : undefined;
     if (!datum) {
@@ -561,49 +660,232 @@ export class FlatEarthView {
     this.tooltipEl.style.left = `${e.clientX}px`;
     this.tooltipEl.style.top = `${e.clientY}px`;
     this.tooltipEl.style.display = '';
-    const dateStr = datum.dateStart ? new Date(datum.dateStart).toLocaleDateString() : 'unknown date';
     clearChildren(this.tooltipEl);
     const strong = document.createElement('strong');
-    strong.textContent = datum.country;
+    strong.textContent = datum.title;
     const line = document.createElement('div');
-    line.textContent = `${datum.deathsBest} fatalities · ${dateStr}`;
+    line.textContent = datum.detail;
     this.tooltipEl.appendChild(strong);
     this.tooltipEl.appendChild(line);
   }
 
-  // Live conflict-event markers, reprojected via the exact same local(x,y)
-  // formula the disc texture and geometry UVs derive from, so they line up
-  // with the map underneath rather than drifting from two independently
-  // reasoned coordinate systems.
-  private async loadConflictMarkers(group: THREE.Group): Promise<void> {
-    try {
-      const resp = await fetchUcdpEvents();
-      if (!resp.success) return;
-      const markerGeo = new THREE.SphereGeometry(0.6, 12, 12);
-      for (const event of resp.data) {
-        if (!Number.isFinite(event.latitude) || !Number.isFinite(event.longitude)) continue;
-        const local = projectLonLatLocal(event.longitude, event.latitude);
-        const world = localToWorld(local);
-        const intensity = Math.min(1, (event.deaths_best || 1) / 50);
-        const mat = new THREE.MeshStandardMaterial({
-          color: 0xff3b3b,
-          emissive: 0xff2020,
-          emissiveIntensity: 0.6 + intensity * 0.8,
-        });
-        const marker = new THREE.Mesh(markerGeo, mat);
-        marker.position.copy(world);
-        group.add(marker);
-        this.markerMeshes.push(marker);
-        this.markerData.set(marker, {
-          country: event.country,
-          lat: event.latitude,
-          lon: event.longitude,
-          deathsBest: event.deaths_best || 0,
-          dateStart: event.date_start,
-        });
+  // Registers every layer this view knows about: static reference-data
+  // layers render synchronously (no fetch involved, always available),
+  // live-fetched layers go through the cache-then-refresh path below, and
+  // path/polygon layers (cables, pipelines, conflict zones) get baked into
+  // their own toggleable overlay texture rather than individual 3D line
+  // meshes, reusing the same disc geometry (and its UV override) as the
+  // day/night overlay already does.
+  private initLayers(scene: THREE.Scene, geometry: THREE.CircleGeometry): void {
+    this.addStaticLayer(scene, 'hotspots', INTEL_HOTSPOTS, (d) => ({ lat: d.lat, lon: d.lon }), 0xffaa00,
+      (d) => ({ title: d.name, detail: d.location ?? d.subtext ?? '' }));
+    this.addStaticLayer(scene, 'militaryBases', MILITARY_BASES, (d) => ({ lat: d.lat, lon: d.lon }), 0x6699ff,
+      (d) => ({ title: d.name, detail: [d.country, d.arm].filter(Boolean).join(' · ') }));
+    this.addStaticLayer(scene, 'nuclear', NUCLEAR_FACILITIES, (d) => ({ lat: d.lat, lon: d.lon }), 0xffdd00,
+      (d) => ({ title: d.name, detail: `${d.type} · ${d.status}` }));
+    this.addStaticLayer(scene, 'irradiators', GAMMA_IRRADIATORS, (d) => ({ lat: d.lat, lon: d.lon }), 0xaaff00,
+      (d) => ({ title: d.city, detail: d.country }));
+    this.addStaticLayer(scene, 'spaceports', SPACEPORTS, (d) => ({ lat: d.lat, lon: d.lon }), 0xff66ff,
+      (d) => ({ title: d.name, detail: `${d.country} · ${d.status}` }));
+    this.addStaticLayer(scene, 'minerals', CRITICAL_MINERALS, (d) => ({ lat: d.lat, lon: d.lon }), 0x00ffcc,
+      (d) => ({ title: d.name, detail: `${d.mineral} · ${d.country}` }));
+    this.addStaticLayer(scene, 'economic', ECONOMIC_CENTERS, (d) => ({ lat: d.lat, lon: d.lon }), 0x44ff88,
+      (d) => ({ title: d.name, detail: d.country }));
+    this.addStaticLayer(scene, 'waterways', STRATEGIC_WATERWAYS, (d) => ({ lat: d.lat, lon: d.lon }), 0x00ccff,
+      (d) => ({ title: d.name, detail: d.description ?? '' }));
+
+    const earthquakeGroup = this.makeLayerGroup(scene, 'earthquakes');
+    const gpsJamGroup = this.makeLayerGroup(scene, 'gpsJamming');
+    const radiationGroup = this.makeLayerGroup(scene, 'radiationWatch');
+    const conflictGroup = this.makeLayerGroup(scene, 'conflicts');
+
+    const refreshAll = (): void => {
+      void this.loadLiveLayer('earthquakes', earthquakeGroup, fetchEarthquakes,
+        (d) => (d.location ? { lat: d.location.latitude, lon: d.location.longitude } : null), 0xff5500,
+        (d) => ({ title: `M${d.magnitude.toFixed(1)} — ${d.place}`, detail: `depth ${d.depthKm}km` }));
+      void this.loadLiveLayer('gpsJamming', gpsJamGroup, async () => (await fetchGpsInterference())?.hexes ?? [],
+        (d: GpsJamHex) => ({ lat: d.lat, lon: d.lon }), 0xff00ff,
+        (d: GpsJamHex) => ({ title: `GPS jamming (${d.level})`, detail: `${d.pct.toFixed(1)}% of aircraft affected` }));
+      void this.loadLiveLayer('radiationWatch', radiationGroup, async () => (await fetchRadiationWatch()).observations,
+        (d: RadiationObservation) => ({ lat: d.lat, lon: d.lon }), 0x00ff00,
+        (d: RadiationObservation) => ({ title: d.location, detail: `${d.value} ${d.unit}` }));
+      void this.loadLiveLayer('conflicts', conflictGroup,
+        async () => { const resp = await fetchUcdpEvents(); return resp.success ? resp.data : []; },
+        (d) => ({ lat: d.latitude, lon: d.longitude }), 0xff3b3b,
+        (d) => ({ title: d.country, detail: `${d.deaths_best || 0} fatalities · ${d.date_start}` }));
+    };
+    refreshAll();
+    this.refreshTimer = setInterval(refreshAll, LIVE_LAYER_REFRESH_INTERVAL_MS);
+
+    this.addOverlayLayer(scene, geometry, 'cables',
+      (ctx, toCanvas) => this.drawPaths(ctx, toCanvas, UNDERSEA_CABLES, 'rgba(255, 210, 60, 0.85)'));
+    this.addOverlayLayer(scene, geometry, 'pipelines',
+      (ctx, toCanvas) => this.drawPaths(ctx, toCanvas, PIPELINES, 'rgba(255, 120, 40, 0.85)'));
+    this.addOverlayLayer(scene, geometry, 'conflictZones',
+      (ctx, toCanvas) => this.drawConflictZones(ctx, toCanvas));
+  }
+
+  private makeLayerGroup(scene: THREE.Scene, key: string): THREE.Group {
+    const group = new THREE.Group();
+    group.visible = this.layers[key] !== false;
+    scene.add(group);
+    this.layerObjects[key] = group;
+    return group;
+  }
+
+  private addStaticLayer<T>(
+    scene: THREE.Scene, key: string, items: T[],
+    getLatLon: (item: T) => { lat: number; lon: number },
+    color: number,
+    getTooltip: (item: T) => { title: string; detail: string },
+  ): void {
+    const group = this.makeLayerGroup(scene, key);
+    this.addPointMarkers(group, items, getLatLon, color, getTooltip);
+  }
+
+  // Reprojected via the exact same local(x,y) formula the disc texture and
+  // geometry UVs derive from, so every layer lines up with the map
+  // underneath rather than drifting from independently-reasoned coordinate
+  // systems -- same principle the original conflict-marker comment here
+  // established, now shared by every point layer.
+  private addPointMarkers<T>(
+    group: THREE.Group, items: T[],
+    getLatLon: (item: T) => { lat: number; lon: number } | null,
+    color: number,
+    getTooltip: (item: T) => { title: string; detail: string },
+    radius = 0.5,
+  ): void {
+    const geo = new THREE.SphereGeometry(radius, 10, 10);
+    for (const item of items) {
+      const ll = getLatLon(item);
+      if (!ll || !Number.isFinite(ll.lat) || !Number.isFinite(ll.lon)) continue;
+      const world = localToWorld(projectLonLatLocal(ll.lon, ll.lat));
+      const marker = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.55 }));
+      marker.position.copy(world);
+      group.add(marker);
+      this.markerMeshes.push(marker);
+      this.markerData.set(marker, getTooltip(item));
+    }
+  }
+
+  private clearGroupMarkers(group: THREE.Group): void {
+    for (const child of [...group.children]) {
+      group.remove(child);
+      const idx = this.markerMeshes.indexOf(child as THREE.Mesh);
+      if (idx !== -1) this.markerMeshes.splice(idx, 1);
+      if (child instanceof THREE.Mesh) {
+        // Geometry is shared across one addPointMarkers() call's worth of
+        // markers -- disposing it once per mesh is safe/idempotent, only
+        // the per-marker material actually needs individual disposal.
+        child.geometry.dispose();
+        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        for (const mat of mats) mat.dispose();
       }
-    } catch (err) {
-      console.warn('[FlatEarthView] failed to load conflict markers', err);
+    }
+  }
+
+  // Cache-then-refresh: renders immediately from sessionStorage if present
+  // (even if stale, for an instant view rather than a loading gap), then
+  // fetches fresh data if the cache is missing/old and re-renders -- but
+  // only on success, so a failed fetch leaves whatever was already showing
+  // in place instead of clearing it.
+  private async loadLiveLayer<T>(
+    key: string, group: THREE.Group, fetchFn: () => Promise<T[]>,
+    getLatLon: (item: T) => { lat: number; lon: number } | null,
+    color: number,
+    getTooltip: (item: T) => { title: string; detail: string },
+  ): Promise<void> {
+    const render = (items: T[]): void => {
+      this.clearGroupMarkers(group);
+      this.addPointMarkers(group, items, getLatLon, color, getTooltip);
+    };
+
+    const cached = loadCachedLayer<T>(key);
+    if (cached) render(cached.data);
+
+    const isStale = !cached || Date.now() - cached.fetchedAt > LIVE_LAYER_CACHE_TTL_MS;
+    if (isStale) {
+      try {
+        const fresh = await fetchFn();
+        saveCachedLayer(key, fresh);
+        render(fresh);
+      } catch (err) {
+        console.warn(`[FlatEarthView] failed to refresh layer "${key}"`, err);
+      }
+    }
+  }
+
+  // Path/polygon layers get baked into their own small overlay texture
+  // (same disc shape/UV as the day/night overlay) rather than individual
+  // 3D line meshes -- simpler, and static data that never needs a redraw.
+  private addOverlayLayer(
+    scene: THREE.Scene, geometry: THREE.CircleGeometry, key: string,
+    draw: (ctx: CanvasRenderingContext2D, toCanvas: (local: { x: number; y: number }) => [number, number]) => void,
+  ): void {
+    const canvas = document.createElement('canvas');
+    canvas.width = TEXTURE_SIZE;
+    canvas.height = TEXTURE_SIZE;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const center = TEXTURE_SIZE / 2;
+    const toCanvas = (local: { x: number; y: number }): [number, number] => [
+      center + (local.x / DISC_RADIUS) * center,
+      center + (local.y / DISC_RADIUS) * center,
+    ];
+    draw(ctx, toCanvas);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.flipY = false;
+    const mesh = new THREE.Mesh(
+      geometry.clone(), // same UV-overridden shape as the base disc
+      new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false }),
+    );
+    mesh.rotation.x = -Math.PI / 2;
+    // Stacked just above the base disc/day-night overlay, each subsequent
+    // one a hair higher to avoid z-fighting between overlays.
+    mesh.position.y = 0.1 + Object.keys(this.layerObjects).length * 0.01;
+    mesh.visible = this.layers[key] !== false;
+    scene.add(mesh);
+    this.layerObjects[key] = mesh;
+  }
+
+  private drawPaths(
+    ctx: CanvasRenderingContext2D,
+    toCanvas: (local: { x: number; y: number }) => [number, number],
+    items: Array<{ points: [number, number][] }>,
+    color: string,
+  ): void {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    for (const item of items) {
+      ctx.beginPath();
+      item.points.forEach(([lon, lat], i) => {
+        const [x, y] = toCanvas(projectLonLatLocal(lon ?? 0, lat ?? 0));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+  }
+
+  private drawConflictZones(
+    ctx: CanvasRenderingContext2D,
+    toCanvas: (local: { x: number; y: number }) => [number, number],
+  ): void {
+    for (const zone of CONFLICT_ZONES) {
+      const [fill, stroke] = zone.intensity === 'high' ? ['rgba(255, 40, 40, 0.30)', 'rgba(255, 40, 40, 0.9)']
+        : zone.intensity === 'medium' ? ['rgba(255, 120, 0, 0.25)', 'rgba(255, 120, 0, 0.9)']
+        : ['rgba(255, 200, 0, 0.20)', 'rgba(255, 200, 0, 0.9)'];
+      ctx.fillStyle = fill;
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      zone.coords.forEach(([lon, lat], i) => {
+        const [x, y] = toCanvas(projectLonLatLocal(lon ?? 0, lat ?? 0));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
     }
   }
 
