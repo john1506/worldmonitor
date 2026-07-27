@@ -154,6 +154,13 @@ export class FlatEarthView {
   private markerData = new WeakMap<THREE.Mesh, ConflictMarkerDatum>();
   private raycaster = new THREE.Raycaster();
   private tooltipEl: HTMLElement | null = null;
+  private conflictGroup: THREE.Group | null = null;
+  // Extensible on purpose -- more signal types (flights, ships, satellites)
+  // can each get their own THREE.Group + a row in this same layers panel
+  // later, following the same pattern as this first one.
+  private layers: Record<string, boolean> = {
+    conflicts: localStorage.getItem('wm-flat-earth-layer-conflicts') !== '0',
+  };
 
   public async open(): Promise<void> {
     if (this.overlay) return;
@@ -161,12 +168,13 @@ export class FlatEarthView {
     const viewport = h('div', { className: 'flat-earth-viewport' });
     const status = h('div', { className: 'flat-earth-status' }, 'Loading NASA imagery and live conflict data...');
     const tooltip = h('div', { className: 'flat-earth-tooltip', style: { display: 'none' } });
+    const layersPanel = this.buildLayersPanel();
     const overlay = h('div', { className: 'flat-earth-overlay' },
       h('div', { className: 'flat-earth-header' },
         h('div', { className: 'flat-earth-title' }, '\u{1F9CA} Flat Earth View'),
         h('button', { className: 'flat-earth-close', 'aria-label': 'Close', onClick: () => this.close() }, '×'),
       ),
-      h('div', { className: 'flat-earth-viewport-wrap' }, viewport, status, tooltip),
+      h('div', { className: 'flat-earth-viewport-wrap' }, viewport, layersPanel, status, tooltip),
       h('div', { className: 'flat-earth-hint' }, 'Drag to look around · scroll to zoom · click a marker for details · purely for fun, not a serious model of the Earth'),
     );
     overlay.addEventListener('click', (e) => { if (e.target === overlay) this.close(); });
@@ -215,6 +223,7 @@ export class FlatEarthView {
     this.resizeObserver = null;
     this.markerMeshes = [];
     this.tooltipEl = null;
+    this.conflictGroup = null;
   }
 
   private async initScene(viewport: HTMLElement): Promise<void> {
@@ -276,7 +285,11 @@ export class FlatEarthView {
     this.renderer = renderer;
     this.controls = controls;
 
-    void this.loadConflictMarkers(scene);
+    const conflictGroup = new THREE.Group();
+    conflictGroup.visible = this.layers.conflicts !== false;
+    scene.add(conflictGroup);
+    this.conflictGroup = conflictGroup;
+    void this.loadConflictMarkers(conflictGroup);
 
     renderer.domElement.addEventListener('click', (e) => this.handleClick(e, renderer, camera));
 
@@ -292,6 +305,38 @@ export class FlatEarthView {
     animate();
   }
 
+  // One row per signal type. Only "conflicts" is wired to real data right
+  // now; more (flights, ships, satellites) can follow the same pattern --
+  // add a THREE.Group, a default in `layers`, and a row here.
+  private buildLayersPanel(): HTMLElement {
+    const rows: Array<{ key: string; label: string }> = [
+      { key: 'conflicts', label: '⚔️ Conflict events' },
+    ];
+    return h('div', { className: 'flat-earth-layers' },
+      h('div', { className: 'flat-earth-layers-title' }, 'Signals'),
+      ...rows.map(({ key, label }) => {
+        const checkbox = h('input', {
+          type: 'checkbox',
+          onChange: (e: Event) => this.setLayerEnabled(key, (e.target as HTMLInputElement).checked),
+        }) as HTMLInputElement;
+        // Set as a real DOM property, not an h()-applied attribute -- a
+        // "false" value passed through setAttribute('checked', 'false')
+        // would still render checked, since HTML checkbox state is
+        // presence-based, not value-based.
+        checkbox.checked = this.layers[key] !== false;
+        return h('label', { className: 'flat-earth-layer-row' }, checkbox, label);
+      }),
+    );
+  }
+
+  private setLayerEnabled(key: string, enabled: boolean): void {
+    this.layers[key] = enabled;
+    localStorage.setItem(`wm-flat-earth-layer-${key}`, enabled ? '1' : '0');
+    if (key === 'conflicts' && this.conflictGroup) {
+      this.conflictGroup.visible = enabled;
+    }
+  }
+
   private handleResize(viewport: HTMLElement): void {
     if (!this.renderer || !this.camera) return;
     const width = Math.max(1, viewport.clientWidth);
@@ -302,7 +347,7 @@ export class FlatEarthView {
   }
 
   private handleClick(e: MouseEvent, renderer: THREE.WebGLRenderer, camera: THREE.PerspectiveCamera): void {
-    if (!this.tooltipEl || this.markerMeshes.length === 0) return;
+    if (!this.tooltipEl || this.markerMeshes.length === 0 || this.layers.conflicts === false) return;
     const rect = renderer.domElement.getBoundingClientRect();
     const pointer = new THREE.Vector2(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
@@ -333,7 +378,7 @@ export class FlatEarthView {
   // formula the disc texture and geometry UVs derive from, so they line up
   // with the map underneath rather than drifting from two independently
   // reasoned coordinate systems.
-  private async loadConflictMarkers(scene: THREE.Scene): Promise<void> {
+  private async loadConflictMarkers(group: THREE.Group): Promise<void> {
     try {
       const resp = await fetchUcdpEvents();
       if (!resp.success) return;
@@ -350,7 +395,7 @@ export class FlatEarthView {
         });
         const marker = new THREE.Mesh(markerGeo, mat);
         marker.position.copy(world);
-        scene.add(marker);
+        group.add(marker);
         this.markerMeshes.push(marker);
         this.markerData.set(marker, {
           country: event.country,

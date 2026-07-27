@@ -8004,6 +8004,36 @@ a.prediction-link:hover {
   height: 100%;
 }
 
+.flat-earth-layers {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  background: rgba(10, 12, 16, 0.85);
+  border: 1px solid rgba(90, 255, 140, 0.3);
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-size: 11px;
+  color: #d4d4d4;
+  z-index: 1;
+}
+
+.flat-earth-layers-title {
+  color: var(--green, #5aff8c);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.flat-earth-layer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
 .flat-earth-status {
   position: absolute;
   top: 50%;
