@@ -113,7 +113,14 @@ function reprojectMercatorToAzimuthal(source: HTMLCanvasElement, outSize: number
       const outIdx = (oy * outSize + ox) * 4;
       if (rho > center) continue; // outside the disc -- never sampled by the mesh anyway
 
-      const lonRad = Math.atan2(dx, -dy);
+      // Must be the exact inverse of projectLonLatLocal/toCanvas's forward
+      // mapping (dx = rho*sin(lonRad), dy = rho*cos(lonRad)) -- an earlier
+      // version had a stray negation here (atan2(dx, -dy)) that silently
+      // reflected the sampled longitude (recovers PI-lonRad instead of
+      // lonRad), which is what produced real, recognizable imagery that was
+      // nonetheless mirrored relative to the correctly-projected border
+      // outlines and markers drawn on top of it.
+      const lonRad = Math.atan2(dx, dy);
       const latRad = Math.PI / 2 - (rho / center) * Math.PI;
 
       if (latRad > maxLatRad || latRad < -maxLatRad) {
