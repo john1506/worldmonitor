@@ -7952,6 +7952,75 @@ a.prediction-link:hover {
   flex-shrink: 0;
 }
 
+/* Flat Earth View -- a just-for-fun 3D "Truman Show" novelty view, same
+   full-screen overlay pattern as the imagery COG viewer above. */
+.flat-earth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(0, 0, 0, 0.92);
+  display: flex;
+  flex-direction: column;
+}
+
+.flat-earth-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  color: #fff;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.flat-earth-title {
+  font-weight: 600;
+}
+
+.flat-earth-close {
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+
+.flat-earth-viewport-wrap {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+}
+
+.flat-earth-viewport {
+  position: absolute;
+  inset: 0;
+}
+
+.flat-earth-viewport canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.flat-earth-status {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: #fff;
+  font-size: 12px;
+}
+
+.flat-earth-hint {
+  text-align: center;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 10px;
+  padding: 8px;
+  flex-shrink: 0;
+}
+
 /* Loading */
 .loading {
   display: flex;

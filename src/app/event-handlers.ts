@@ -2172,6 +2172,22 @@ export class EventHandlerManager implements AppModule {
 
     this.setupMapFullscreen(mapSection);
     this.setupMapDimensionToggle();
+    this.setupFlatEarthViewButton();
+  }
+
+  // Standalone full-screen overlay (like the imagery COG viewer), not part of
+  // the globe/flat mode-switching state machine -- opening it doesn't touch
+  // MapContainer at all, just for-fun and easy to remove if it isn't.
+  private setupFlatEarthViewButton(): void {
+    const btn = document.getElementById('flatEarthViewBtn');
+    if (!btn) return;
+    let viewer: import('@/components/FlatEarthView').FlatEarthView | null = null;
+    btn.addEventListener('click', () => {
+      void import('@/components/FlatEarthView').then(({ FlatEarthView }) => {
+        if (!viewer) viewer = new FlatEarthView();
+        void viewer.open();
+      });
+    });
   }
 
   private setupMapDimensionToggle(): void {
