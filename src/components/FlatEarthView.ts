@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { CSS2DObject, CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { h, clearChildren } from '@/utils/dom-utils';
 import { getCountriesGeoJson } from '@/services/country-geometry';
 import { fetchUcdpEvents } from '@/services/conflict';
@@ -82,6 +83,10 @@ function projectLonLatLocal(lon: number, lat: number): { x: number; y: number } 
 // z*cos(theta) = y*(-1) + 0 = -y). Local z is always 0 for a flat circle.
 function localToWorld(local: { x: number; y: number }): THREE.Vector3 {
   return new THREE.Vector3(local.x, MARKER_ALTITUDE, -local.y);
+}
+
+function cssColor(hex: number): string {
+  return '#' + hex.toString(16).padStart(6, '0');
 }
 
 // ─── Astronomy: subsolar point, moon phase, sublunar point ─────────────────
@@ -474,14 +479,12 @@ function saveCachedLayer<T>(key: string, data: T[]): void {
 export class FlatEarthView {
   private overlay: HTMLElement | null = null;
   private renderer: THREE.WebGLRenderer | null = null;
+  private labelRenderer: CSS2DRenderer | null = null;
   private scene: THREE.Scene | null = null;
   private camera: THREE.PerspectiveCamera | null = null;
   private controls: OrbitControls | null = null;
   private animationFrame: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
-  private markerMeshes: THREE.Mesh[] = [];
-  private markerData = new WeakMap<THREE.Mesh, MarkerTooltipDatum>();
-  private raycaster = new THREE.Raycaster();
   private tooltipEl: HTMLElement | null = null;
   private sunMoonGroup: THREE.Group | null = null;
   private dayNightMesh: THREE.Mesh | null = null;
@@ -564,16 +567,19 @@ export class FlatEarthView {
       }
     });
     this.renderer?.dispose();
+    // labelRenderer.domElement is a child of viewport (itself inside
+    // overlay), so overlay.remove() below takes the whole label DOM subtree
+    // with it -- no separate disposal call needed (CSS2DRenderer has none).
     this.overlay.remove();
 
     this.overlay = null;
     this.renderer = null;
+    this.labelRenderer = null;
     this.scene = null;
     this.camera = null;
     this.controls = null;
     this.animationFrame = null;
     this.resizeObserver = null;
-    this.markerMeshes = [];
     this.tooltipEl = null;
     this.sunMoonGroup = null;
     this.dayNightMesh = null;
@@ -597,6 +603,21 @@ export class FlatEarthView {
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     viewport.appendChild(renderer.domElement);
+
+    // HTML/CSS glyph markers (matching the 3D globe's own GlobeMap.ts marker
+    // style) instead of raw WebGL sphere meshes -- rendered as a separate
+    // absolutely-positioned layer on top of the canvas. pointer-events:none
+    // on the layer itself lets drag/orbit and empty-space clicks fall
+    // through to the canvas below; individual marker elements opt back into
+    // pointer-events:auto so they stay clickable.
+    const labelRenderer = new CSS2DRenderer();
+    labelRenderer.setSize(width, height);
+    labelRenderer.domElement.style.position = 'absolute';
+    labelRenderer.domElement.style.top = '0';
+    labelRenderer.domElement.style.left = '0';
+    labelRenderer.domElement.style.pointerEvents = 'none';
+    viewport.appendChild(labelRenderer.domElement);
+    this.labelRenderer = labelRenderer;
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(0, 0, 0);
@@ -703,7 +724,12 @@ export class FlatEarthView {
 
     this.initLayers(scene, geometry);
 
-    renderer.domElement.addEventListener('click', (e) => this.handleClick(e, renderer, camera));
+    // Markers now handle their own clicks directly (see buildMarkerElement);
+    // this just hides the tooltip when a click reaches the canvas itself,
+    // i.e. lands on empty space rather than a marker element on top of it.
+    renderer.domElement.addEventListener('click', () => {
+      if (this.tooltipEl) this.tooltipEl.style.display = 'none';
+    });
 
     const resizeObserver = new ResizeObserver(() => this.handleResize(viewport));
     resizeObserver.observe(viewport);
@@ -713,6 +739,7 @@ export class FlatEarthView {
       this.animationFrame = requestAnimationFrame(animate);
       controls.update();
       renderer.render(scene, camera);
+      labelRenderer.render(scene, camera);
     };
     animate();
   }
@@ -777,32 +804,15 @@ export class FlatEarthView {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height);
+    this.labelRenderer?.setSize(width, height);
   }
 
-  private handleClick(e: MouseEvent, renderer: THREE.WebGLRenderer, camera: THREE.PerspectiveCamera): void {
-    if (!this.tooltipEl || this.markerMeshes.length === 0) return;
-    const rect = renderer.domElement.getBoundingClientRect();
-    const pointer = new THREE.Vector2(
-      ((e.clientX - rect.left) / rect.width) * 2 - 1,
-      -((e.clientY - rect.top) / rect.height) * 2 + 1,
-    );
-    this.raycaster.setFromCamera(pointer, camera);
-    // Only raycast against markers whose layer is actually visible right
-    // now (and thus clickable) -- a hidden layer's meshes stay in the scene
-    // graph (just group.visible = false), so they'd otherwise still count
-    // as hits.
-    const visibleMarkers = this.markerMeshes.filter((m) => {
-      let obj: THREE.Object3D | null = m;
-      while (obj) { if (!obj.visible) return false; obj = obj.parent; }
-      return true;
-    });
-    const hits = this.raycaster.intersectObjects(visibleMarkers, false);
-    const hit = hits[0]?.object;
-    const datum = hit instanceof THREE.Mesh ? this.markerData.get(hit) : undefined;
-    if (!datum) {
-      this.tooltipEl.style.display = 'none';
-      return;
-    }
+  // Shown/positioned from a marker element's own click listener now,
+  // instead of a scene-wide raycast -- CSS2DObject markers are real DOM
+  // elements, so they can just tell us directly when they're clicked.
+  private showTooltip(e: MouseEvent, datum: MarkerTooltipDatum): void {
+    if (!this.tooltipEl) return;
+    e.stopPropagation();
     this.tooltipEl.style.left = `${e.clientX}px`;
     this.tooltipEl.style.top = `${e.clientY}px`;
     this.tooltipEl.style.display = '';
@@ -815,6 +825,21 @@ export class FlatEarthView {
     this.tooltipEl.appendChild(line);
   }
 
+  // Same visual convention GlobeMap.ts's own glyph markers use: a small
+  // emoji, colored and glowing via text-shadow, in an invisible 20x20px hit
+  // target for easier clicking. `color` only styles the glyph -- there's no
+  // separate geometry/material to manage since this is a plain DOM element.
+  private buildMarkerElement(glyph: string, color: number): HTMLElement {
+    const c = cssColor(color);
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'width:20px;height:20px;display:flex;align-items:center;justify-content:center;pointer-events:auto;cursor:pointer;user-select:none;';
+    const glyphEl = document.createElement('div');
+    glyphEl.style.cssText = `font-size:13px;color:${c};text-shadow:0 0 4px ${c}88;line-height:1;`;
+    glyphEl.textContent = glyph;
+    wrap.appendChild(glyphEl);
+    return wrap;
+  }
+
   // Registers every layer this view knows about: static reference-data
   // layers render synchronously (no fetch involved, always available),
   // live-fetched layers go through the cache-then-refresh path below, and
@@ -823,21 +848,21 @@ export class FlatEarthView {
   // meshes, reusing the same disc geometry (and its UV override) as the
   // day/night overlay already does.
   private initLayers(scene: THREE.Scene, geometry: THREE.CircleGeometry): void {
-    this.addStaticLayer(scene, 'hotspots', INTEL_HOTSPOTS, (d) => ({ lat: d.lat, lon: d.lon }), 0xffaa00,
+    this.addStaticLayer(scene, 'hotspots', INTEL_HOTSPOTS, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1F3AF}', 0xffaa00,
       (d) => ({ title: d.name, detail: d.location ?? d.subtext ?? '' }));
-    this.addStaticLayer(scene, 'militaryBases', MILITARY_BASES, (d) => ({ lat: d.lat, lon: d.lon }), 0x6699ff,
+    this.addStaticLayer(scene, 'militaryBases', MILITARY_BASES, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1FA96}', 0x6699ff,
       (d) => ({ title: d.name, detail: [d.country, d.arm].filter(Boolean).join(' · ') }));
-    this.addStaticLayer(scene, 'nuclear', NUCLEAR_FACILITIES, (d) => ({ lat: d.lat, lon: d.lon }), 0xffdd00,
+    this.addStaticLayer(scene, 'nuclear', NUCLEAR_FACILITIES, (d) => ({ lat: d.lat, lon: d.lon }), '☢️', 0xffdd00,
       (d) => ({ title: d.name, detail: `${d.type} · ${d.status}` }));
-    this.addStaticLayer(scene, 'irradiators', GAMMA_IRRADIATORS, (d) => ({ lat: d.lat, lon: d.lon }), 0xaaff00,
+    this.addStaticLayer(scene, 'irradiators', GAMMA_IRRADIATORS, (d) => ({ lat: d.lat, lon: d.lon }), '☣️', 0xaaff00,
       (d) => ({ title: d.city, detail: d.country }));
-    this.addStaticLayer(scene, 'spaceports', SPACEPORTS, (d) => ({ lat: d.lat, lon: d.lon }), 0xff66ff,
+    this.addStaticLayer(scene, 'spaceports', SPACEPORTS, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1F680}', 0xff66ff,
       (d) => ({ title: d.name, detail: `${d.country} · ${d.status}` }));
-    this.addStaticLayer(scene, 'minerals', CRITICAL_MINERALS, (d) => ({ lat: d.lat, lon: d.lon }), 0x00ffcc,
+    this.addStaticLayer(scene, 'minerals', CRITICAL_MINERALS, (d) => ({ lat: d.lat, lon: d.lon }), '⛏️', 0x00ffcc,
       (d) => ({ title: d.name, detail: `${d.mineral} · ${d.country}` }));
-    this.addStaticLayer(scene, 'economic', ECONOMIC_CENTERS, (d) => ({ lat: d.lat, lon: d.lon }), 0x44ff88,
+    this.addStaticLayer(scene, 'economic', ECONOMIC_CENTERS, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1F4B9}', 0x44ff88,
       (d) => ({ title: d.name, detail: d.country }));
-    this.addStaticLayer(scene, 'waterways', STRATEGIC_WATERWAYS, (d) => ({ lat: d.lat, lon: d.lon }), 0x00ccff,
+    this.addStaticLayer(scene, 'waterways', STRATEGIC_WATERWAYS, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1F30A}', 0x00ccff,
       (d) => ({ title: d.name, detail: d.description ?? '' }));
 
     const earthquakeGroup = this.makeLayerGroup(scene, 'earthquakes');
@@ -847,17 +872,17 @@ export class FlatEarthView {
 
     const refreshAll = (): void => {
       void this.loadLiveLayer('earthquakes', earthquakeGroup, fetchEarthquakes,
-        (d) => (d.location ? { lat: d.location.latitude, lon: d.location.longitude } : null), 0xff5500,
+        (d) => (d.location ? { lat: d.location.latitude, lon: d.location.longitude } : null), '\u{1F30D}', 0xff5500,
         (d) => ({ title: `M${d.magnitude.toFixed(1)} — ${d.place}`, detail: `depth ${d.depthKm}km` }));
       void this.loadLiveLayer('gpsJamming', gpsJamGroup, async () => (await fetchGpsInterference())?.hexes ?? [],
-        (d: GpsJamHex) => ({ lat: d.lat, lon: d.lon }), 0xff00ff,
+        (d: GpsJamHex) => ({ lat: d.lat, lon: d.lon }), '\u{1F4E1}', 0xff00ff,
         (d: GpsJamHex) => ({ title: `GPS jamming (${d.level})`, detail: `${d.pct.toFixed(1)}% of aircraft affected` }));
       void this.loadLiveLayer('radiationWatch', radiationGroup, async () => (await fetchRadiationWatch()).observations,
-        (d: RadiationObservation) => ({ lat: d.lat, lon: d.lon }), 0x00ff00,
+        (d: RadiationObservation) => ({ lat: d.lat, lon: d.lon }), '☢️', 0x00ff00,
         (d: RadiationObservation) => ({ title: d.location, detail: `${d.value} ${d.unit}` }));
       void this.loadLiveLayer('conflicts', conflictGroup,
         async () => { const resp = await fetchUcdpEvents(); return resp.success ? resp.data : []; },
-        (d) => ({ lat: d.latitude, lon: d.longitude }), 0xff3b3b,
+        (d) => ({ lat: d.latitude, lon: d.longitude }), '⚔️', 0xff3b3b,
         (d) => ({ title: d.country, detail: `${d.deaths_best || 0} fatalities · ${d.date_start}` }));
     };
     refreshAll();
@@ -886,25 +911,37 @@ export class FlatEarthView {
       const tles = await fetchSatelliteTLEs();
       if (!tles || tles.length === 0) return;
       const satRecs = await initSatRecs(tles);
-      const meshByNoradId = new Map<string, THREE.Mesh>();
-      const geo = new THREE.SphereGeometry(0.5, 8, 8);
+      // Tracks both the CSS2DObject and its latest known position/name/etc
+      // per satellite -- the click listener reads `latest` at click-time
+      // (via the Map, keyed by the closed-over noradId) rather than
+      // capturing a snapshot, so the tooltip always reflects the most
+      // recent propagated position even though the element itself is only
+      // created once.
+      const byNoradId = new Map<string, { obj: CSS2DObject; latest: SatellitePosition }>();
 
       const render = (positions: SatellitePosition[]): void => {
         for (const pos of positions) {
           if (!Number.isFinite(pos.lat) || !Number.isFinite(pos.lng)) continue;
           const world = satellitePosition(pos.lat, pos.lng, pos.alt);
-          let mesh = meshByNoradId.get(pos.noradId);
-          if (!mesh) {
-            mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x88ddff, emissive: 0x2266aa, emissiveIntensity: 0.8 }));
-            group.add(mesh);
-            this.markerMeshes.push(mesh);
-            meshByNoradId.set(pos.noradId, mesh);
+          let entry = byNoradId.get(pos.noradId);
+          if (!entry) {
+            const el = this.buildMarkerElement('\u{1F6F0}\u{FE0F}', 0x88ddff);
+            el.addEventListener('click', (e) => {
+              const current = byNoradId.get(pos.noradId)?.latest;
+              if (current) {
+                this.showTooltip(e, {
+                  title: current.name,
+                  detail: `${current.type} · alt ${Math.round(current.alt)}km · ${current.velocity.toFixed(1)} km/s`,
+                });
+              }
+            });
+            const obj = new CSS2DObject(el);
+            group.add(obj);
+            entry = { obj, latest: pos };
+            byNoradId.set(pos.noradId, entry);
           }
-          mesh.position.copy(world);
-          this.markerData.set(mesh, {
-            title: pos.name,
-            detail: `${pos.type} · alt ${Math.round(pos.alt)}km · ${pos.velocity.toFixed(1)} km/s`,
-          });
+          entry.obj.position.copy(world);
+          entry.latest = pos;
         }
       };
 
@@ -926,52 +963,44 @@ export class FlatEarthView {
   private addStaticLayer<T>(
     scene: THREE.Scene, key: string, items: T[],
     getLatLon: (item: T) => { lat: number; lon: number },
-    color: number,
+    glyph: string, color: number,
     getTooltip: (item: T) => { title: string; detail: string },
   ): void {
     const group = this.makeLayerGroup(scene, key);
-    this.addPointMarkers(group, items, getLatLon, color, getTooltip);
+    this.addPointMarkers(group, items, getLatLon, glyph, color, getTooltip);
   }
 
   // Reprojected via the exact same local(x,y) formula the disc texture and
   // geometry UVs derive from, so every layer lines up with the map
   // underneath rather than drifting from independently-reasoned coordinate
   // systems -- same principle the original conflict-marker comment here
-  // established, now shared by every point layer.
+  // established, now shared by every point layer. Markers are CSS2DObject-
+  // wrapped HTML glyphs (see buildMarkerElement) rather than WebGL sphere
+  // meshes, matching the 3D globe's own marker style.
   private addPointMarkers<T>(
     group: THREE.Group, items: T[],
     getLatLon: (item: T) => { lat: number; lon: number } | null,
-    color: number,
+    glyph: string, color: number,
     getTooltip: (item: T) => { title: string; detail: string },
-    radius = 0.5,
   ): void {
-    const geo = new THREE.SphereGeometry(radius, 10, 10);
     for (const item of items) {
       const ll = getLatLon(item);
       if (!ll || !Number.isFinite(ll.lat) || !Number.isFinite(ll.lon)) continue;
       const world = localToWorld(projectLonLatLocal(ll.lon, ll.lat));
-      const marker = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.55 }));
-      marker.position.copy(world);
-      group.add(marker);
-      this.markerMeshes.push(marker);
-      this.markerData.set(marker, getTooltip(item));
+      const el = this.buildMarkerElement(glyph, color);
+      const datum = getTooltip(item);
+      el.addEventListener('click', (e) => this.showTooltip(e, datum));
+      const obj = new CSS2DObject(el);
+      obj.position.copy(world);
+      group.add(obj);
     }
   }
 
+  // CSS2DObject fires a 'removed' event (see its constructor) that detaches
+  // its own DOM element automatically once removed from the scene graph --
+  // no manual per-marker DOM/material disposal needed here any more.
   private clearGroupMarkers(group: THREE.Group): void {
-    for (const child of [...group.children]) {
-      group.remove(child);
-      const idx = this.markerMeshes.indexOf(child as THREE.Mesh);
-      if (idx !== -1) this.markerMeshes.splice(idx, 1);
-      if (child instanceof THREE.Mesh) {
-        // Geometry is shared across one addPointMarkers() call's worth of
-        // markers -- disposing it once per mesh is safe/idempotent, only
-        // the per-marker material actually needs individual disposal.
-        child.geometry.dispose();
-        const mats = Array.isArray(child.material) ? child.material : [child.material];
-        for (const mat of mats) mat.dispose();
-      }
-    }
+    for (const child of [...group.children]) group.remove(child);
   }
 
   // Cache-then-refresh: renders immediately from sessionStorage if present
@@ -982,12 +1011,12 @@ export class FlatEarthView {
   private async loadLiveLayer<T>(
     key: string, group: THREE.Group, fetchFn: () => Promise<T[]>,
     getLatLon: (item: T) => { lat: number; lon: number } | null,
-    color: number,
+    glyph: string, color: number,
     getTooltip: (item: T) => { title: string; detail: string },
   ): Promise<void> {
     const render = (items: T[]): void => {
       this.clearGroupMarkers(group);
-      this.addPointMarkers(group, items, getLatLon, color, getTooltip);
+      this.addPointMarkers(group, items, getLatLon, glyph, color, getTooltip);
     };
 
     const cached = loadCachedLayer<T>(key);
