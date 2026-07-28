@@ -3510,6 +3510,13 @@ export class GlobeMap {
   }
 
   public setSatellites(positions: SatellitePosition[]): void {
+    // Starlink (~7,000 satellites, seeded under its own 'STARLINK' bucket --
+    // see seed-satellites.mjs) is opt-in on Flat Earth View's own per-country
+    // filter, defaulted off there specifically because of its scale. This
+    // globe has no equivalent per-country toggle, so excluded here
+    // unconditionally rather than silently flooding it with thousands of
+    // markers this view has no way to hide.
+    positions = positions.filter(s => s.country !== 'STARLINK');
     this.satelliteMarkers = positions.map(s => ({
       _kind: 'satellite' as const,
       _lat: s.lat,

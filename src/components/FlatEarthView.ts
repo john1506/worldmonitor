@@ -222,20 +222,35 @@ function satellitePosition(lat: number, lon: number, altKm: number): THREE.Vecto
 }
 
 // Same country->color mapping GlobeMap.ts's own satellite layer uses, so a
-// given satellite reads as the same color in both views.
+// given satellite reads as the same color in both views -- plus a
+// FlatEarthView-only 'STARLINK' bucket (GlobeMap has no per-country filter,
+// so it excludes Starlink outright rather than adding a color for it; see
+// GlobeMap.ts's setSatellites). Kept separate from 'US' specifically so
+// toggling it off doesn't also hide actual US ISR satellites.
 const SAT_COUNTRY_COLORS: Record<string, number> = {
   CN: 0xff2020, RU: 0xff8800, US: 0x4488ff, EU: 0x44cc44,
   KR: 0xaa66ff, IN: 0xff66aa, TR: 0xff4466, OTHER: 0xccccff,
+  STARLINK: 0x999999,
 };
+
+// Country buckets that should default to *off* the first time this view
+// ever runs (no localStorage entry yet) -- everything else defaults on.
+// Starlink alone is ~7,000 satellites, a real jump in marker count versus
+// every other bucket here (tens each); CSS2DObject markers are real DOM
+// elements repositioned every animation frame, so this is opt-in rather
+// than something that suddenly floods the view for existing users.
+const SAT_COUNTRY_DEFAULT_ENABLED: Record<string, boolean> = { STARLINK: false };
 
 // Same lookup tables GlobeMap.ts's own satellite tooltip uses, so the two
 // views agree on operator name/type label wording, not just marker color.
 const SAT_OPERATOR_NAME: Record<string, string> = {
   CN: 'China', RU: 'Russia', US: 'United States', EU: 'ESA / EU',
   KR: 'South Korea', IN: 'India', TR: 'Turkey', OTHER: 'Other',
+  STARLINK: 'Starlink (SpaceX, US)',
 };
 const SAT_TYPE_LABEL: Record<string, string> = {
   sar: 'SAR Imaging', optical: 'Optical Imaging', military: 'Military', sigint: 'SIGINT',
+  comms: 'Communications',
 };
 
 const SAT_BEAM_RAY_COUNT = 6;
@@ -685,7 +700,14 @@ export class FlatEarthView {
   // someone cares about instead of all-or-nothing. Persisted the same way
   // as `layers` below, keyed by SAT_COUNTRY_COLORS' country codes.
   private satelliteCountryFilter: Record<string, boolean> = Object.fromEntries(
-    Object.keys(SAT_COUNTRY_COLORS).map((c) => [c, localStorage.getItem(`wm-flat-earth-sat-country-${c}`) !== '0']),
+    Object.keys(SAT_COUNTRY_COLORS).map((c) => {
+      const stored = localStorage.getItem(`wm-flat-earth-sat-country-${c}`);
+      // No stored preference yet -> this bucket's own default (see
+      // SAT_COUNTRY_DEFAULT_ENABLED); a stored '0'/'1' always wins once the
+      // user has actually touched this checkbox.
+      const enabled = stored === null ? (SAT_COUNTRY_DEFAULT_ENABLED[c] ?? true) : stored !== '0';
+      return [c, enabled];
+    }),
   );
   // Replays the last-known satellite positions through loadSatellites' own
   // render() closure -- reused so toggling a country filter takes effect
