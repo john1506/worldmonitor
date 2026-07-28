@@ -112,8 +112,16 @@ export const NASA_GIBS_MAX_LEVEL = 8;
 // to be detected and prepended here too, mirroring that same bootstrap's
 // logic. If that build patch's detection regex ever changes, this needs to
 // change with it.
-function toIngressAwareApiPath(apiPath: string): string {
-  if (typeof window === 'undefined') return apiPath;
+//
+// Exported (not just used internally for the NASA tile helpers below) so
+// other same-origin `/api/...` paths returned by this add-on's own backend
+// -- e.g. Imagery Watch's cached-preview route, which is baked into stored
+// history data server-side with no ingress-token context available at
+// write time -- can get the same treatment at render time. Safe to call on
+// an already-absolute URL too (a direct external S3/Azure link): those
+// aren't root-relative, so this is a no-op for them.
+export function toIngressAwareApiPath(apiPath: string): string {
+  if (typeof window === 'undefined' || !apiPath.startsWith('/')) return apiPath;
   const match = window.location.pathname.match(/^(\/api\/hassio_ingress\/[^/]+)\//);
   return match ? match[1] + apiPath : apiPath;
 }
