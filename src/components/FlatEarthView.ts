@@ -594,6 +594,19 @@ export class FlatEarthView {
   private layerObjects: Record<string, THREE.Object3D> = {};
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private satelliteStopFn: (() => void) | null = null;
+  // Per-country sub-filter within the satellites layer, so a busy sky
+  // (100+ objects tracked at once) can be thinned to just the operators
+  // someone cares about instead of all-or-nothing. Persisted the same way
+  // as `layers` below, keyed by SAT_COUNTRY_COLORS' country codes.
+  private satelliteCountryFilter: Record<string, boolean> = Object.fromEntries(
+    Object.keys(SAT_COUNTRY_COLORS).map((c) => [c, localStorage.getItem(`wm-flat-earth-sat-country-${c}`) !== '0']),
+  );
+  // Replays the last-known satellite positions through loadSatellites' own
+  // render() closure -- reused so toggling a country filter takes effect
+  // immediately (updated marker visibility + a re-filtered beam rebuild)
+  // instead of waiting up to 2s for the next propagation tick.
+  private rerenderSatellites: (() => void) | null = null;
+  private latestSatellitePositions: SatellitePosition[] = [];
   private layers: Record<string, boolean> = Object.fromEntries(
     ALL_LAYER_KEYS.map((key) => [key, localStorage.getItem(`wm-flat-earth-layer-${key}`) !== '0']),
   );
@@ -689,6 +702,8 @@ export class FlatEarthView {
     this.layerObjects = {};
     this.refreshTimer = null;
     this.satelliteStopFn = null;
+    this.rerenderSatellites = null;
+    this.latestSatellitePositions = [];
   }
 
   private async initScene(
@@ -936,21 +951,52 @@ export class FlatEarthView {
       { key: 'sunMoon', label: '☀️ Sun & Moon' },
       { key: 'dayNight', label: '\u{1F317} Day / night shading' },
     ];
+    const rowElements: HTMLElement[] = [];
+    for (const { key, label } of rows) {
+      const checkbox = h('input', {
+        type: 'checkbox',
+        onChange: (e: Event) => this.setLayerEnabled(key, (e.target as HTMLInputElement).checked),
+      }) as HTMLInputElement;
+      // Set as a real DOM property, not an h()-applied attribute -- a
+      // "false" value passed through setAttribute('checked', 'false')
+      // would still render checked, since HTML checkbox state is
+      // presence-based, not value-based.
+      checkbox.checked = this.layers[key] !== false;
+      rowElements.push(h('label', { className: 'flat-earth-layer-row' }, checkbox, label));
+      if (key === 'satellites') rowElements.push(this.buildSatelliteCountryFilterRows());
+    }
     return h('div', { className: 'flat-earth-layers' },
       h('div', { className: 'flat-earth-layers-title' }, 'Signals'),
-      ...rows.map(({ key, label }) => {
+      ...rowElements,
+    );
+  }
+
+  // Nested under the "Satellites" row -- lets a given nation's satellites
+  // be toggled independently, so a busy sky (100+ objects at once) can be
+  // thinned to just the operators someone cares about instead of only an
+  // all-or-nothing layer toggle.
+  private buildSatelliteCountryFilterRows(): HTMLElement {
+    return h('div', { className: 'flat-earth-layer-subrows' },
+      ...Object.keys(SAT_COUNTRY_COLORS).map((country) => {
         const checkbox = h('input', {
           type: 'checkbox',
-          onChange: (e: Event) => this.setLayerEnabled(key, (e.target as HTMLInputElement).checked),
+          onChange: (e: Event) => this.setSatelliteCountryEnabled(country, (e.target as HTMLInputElement).checked),
         }) as HTMLInputElement;
-        // Set as a real DOM property, not an h()-applied attribute -- a
-        // "false" value passed through setAttribute('checked', 'false')
-        // would still render checked, since HTML checkbox state is
-        // presence-based, not value-based.
-        checkbox.checked = this.layers[key] !== false;
-        return h('label', { className: 'flat-earth-layer-row' }, checkbox, label);
+        checkbox.checked = this.satelliteCountryFilter[country] !== false;
+        const swatch = h('span', {
+          className: 'flat-earth-sat-swatch',
+          style: { background: cssColor(SAT_COUNTRY_COLORS[country] ?? 0xccccff) },
+        });
+        return h('label', { className: 'flat-earth-layer-row flat-earth-layer-subrow' },
+          checkbox, swatch, SAT_OPERATOR_NAME[country] ?? country);
       }),
     );
+  }
+
+  private setSatelliteCountryEnabled(country: string, enabled: boolean): void {
+    this.satelliteCountryFilter[country] = enabled;
+    localStorage.setItem(`wm-flat-earth-sat-country-${country}`, enabled ? '1' : '0');
+    this.rerenderSatellites?.();
   }
 
   private setLayerEnabled(key: string, enabled: boolean): void {
@@ -1185,11 +1231,16 @@ export class FlatEarthView {
       const byNoradId = new Map<string, { dot: CSS2DObject; footprint: CSS2DObject; latest: SatellitePosition }>();
 
       const render = (positions: SatellitePosition[]): void => {
+        this.latestSatellitePositions = positions;
         for (const pos of positions) {
           if (!Number.isFinite(pos.lat) || !Number.isFinite(pos.lng)) continue;
           const color = SAT_COUNTRY_COLORS[pos.country] ?? 0xccccff;
           const world = satellitePosition(pos.lat, pos.lng, pos.alt);
           const local = projectLonLatLocal(pos.lng, pos.lat);
+          // Per-country sub-filter (see satelliteCountryFilter) -- hides
+          // this satellite's dot/footprint independently of the master
+          // "Satellites" layer toggle above it.
+          const visible = this.satelliteCountryFilter[pos.country] !== false;
           let entry = byNoradId.get(pos.noradId);
           if (!entry) {
             const dotEl = this.buildSatelliteDotElement(color);
@@ -1224,7 +1275,9 @@ export class FlatEarthView {
             byNoradId.set(pos.noradId, entry);
           }
           entry.dot.position.copy(world);
+          entry.dot.visible = visible;
           entry.footprint.position.set(local.x, 0.05, -local.y);
+          entry.footprint.visible = visible;
           entry.latest = pos;
         }
 
@@ -1232,12 +1285,13 @@ export class FlatEarthView {
           group.remove(beamGroup);
           disposeBeamGroup(beamGroup);
         }
-        beamGroup = buildSatelliteBeams(positions);
+        beamGroup = buildSatelliteBeams(positions.filter((p) => this.satelliteCountryFilter[p.country] !== false));
         group.add(beamGroup);
       };
 
       render(propagatePositions(satRecs));
       this.satelliteStopFn = startPropagationLoop(satRecs, render, 2000);
+      this.rerenderSatellites = () => render(this.latestSatellitePositions);
     } catch (err) {
       console.warn('[FlatEarthView] failed to load satellites', err);
     }

@@ -8046,6 +8046,25 @@ a.prediction-link:hover {
   padding: 2px 0;
 }
 
+.flat-earth-layer-subrows {
+  margin: 0 0 2px 20px;
+  padding-left: 6px;
+  border-left: 1px solid rgba(90, 255, 140, 0.2);
+}
+
+.flat-earth-layer-subrow {
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.flat-earth-sat-swatch {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
 .flat-earth-moon-info {
   position: absolute;
   top: 12px;
