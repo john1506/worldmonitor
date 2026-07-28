@@ -7996,6 +7996,16 @@ a.prediction-link:hover {
 .flat-earth-viewport {
   position: absolute;
   inset: 0;
+  /* Establishes its own stacking context (position + an explicit z-index).
+     Without this, CSS2DRenderer's per-marker inline z-index (it assigns each
+     glyph a value up to the marker count, for camera-distance sorting)
+     bubbles straight up past this element -- which itself has no stacking
+     context to contain it -- to compete directly with the layers
+     panel/tooltip/moon-info's z-index:1 in the shared ancestor context, and
+     wins once there are more than one of them. Scoping it here keeps every
+     marker's z-index contained below the UI chrome regardless of how many
+     markers exist. */
+  z-index: 0;
 }
 
 .flat-earth-viewport canvas {
