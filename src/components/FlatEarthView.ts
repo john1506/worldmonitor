@@ -683,10 +683,21 @@ export class FlatEarthView {
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x030507);
-    scene.fog = new THREE.FogExp2(0x030507, 0.012);
+    // Was 0.012 -- at the old default camera distance (~85 units) that
+    // worked out to a ~65% blend toward near-black, which is what made the
+    // whole disc read as flat grey regardless of the actual imagery/lighting
+    // underneath. Tuned instead so it's barely perceptible at normal viewing
+    // distance and only actually fades in near the far end of the zoom range.
+    scene.fog = new THREE.FogExp2(0x030507, 0.0045);
 
     const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 500);
-    camera.position.set(0, DISC_RADIUS * 1.1, DISC_RADIUS * 1.3);
+    // Tighter default framing than a naive "fit the whole disc" distance --
+    // CSS2D markers are fixed-pixel-size DOM elements, so the only way to
+    // give closely-spaced satellites (or any other layer) more visual
+    // separation is to have the disc itself occupy more of the screen by
+    // default, not to change any world-space scale (which a fixed-multiple
+    // camera distance would just cancel out).
+    camera.position.set(0, DISC_RADIUS * 0.85, DISC_RADIUS * 1.0);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(width, height);
@@ -719,7 +730,7 @@ export class FlatEarthView {
     controls.dampingFactor = 0.08;
     controls.update();
 
-    scene.add(new THREE.AmbientLight(0x8899bb, 0.7));
+    scene.add(new THREE.AmbientLight(0x8899bb, 0.85));
     const sunPos = skyPosition(subsolar.lat, subsolar.lon, SUN_DISTANCE);
     // Real subsolar direction -- lights the wall/markers from the actual
     // current sun direction, not a fixed decorative angle.
@@ -736,7 +747,16 @@ export class FlatEarthView {
     const { blueMarble: blueMarbleCanvas, cityLights: cityLightsCanvas } = await getCachedTileImagery(tileZoom);
 
     const { texture, geometry } = await this.buildDisc(blueMarbleCanvas);
-    const disc = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ map: texture, roughness: 0.85, metalness: 0.05 }));
+    // Unlit (MeshBasicMaterial), not MeshStandardMaterial: the dedicated
+    // dayNightMesh overlay right below already does the actual day/night
+    // shading against real sun position, so a standard material's own
+    // cosine-falloff lighting on the disc itself was double-dimming
+    // everything away from the subsolar point on top of that -- between
+    // that and the old fog density, the disc read as flat grey almost
+    // everywhere instead of showing the real NASA imagery colors. `fog:
+    // false` keeps the true colors legible even at the outer edge of the
+    // zoom range, where fog still fades the wall/background for depth.
+    const disc = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: texture, fog: false }));
     disc.rotation.x = -Math.PI / 2;
     scene.add(disc);
 
@@ -777,7 +797,7 @@ export class FlatEarthView {
     const dayNightTexture = this.buildDayNightTexture(subsolar, sublunar, blueMarbleCanvas, cityLightsCanvas);
     const dayNightMesh = new THREE.Mesh(
       geometry.clone(), // same UV-overridden shape, no need to redo that per-vertex loop
-      new THREE.MeshBasicMaterial({ map: dayNightTexture, transparent: true, depthWrite: false }),
+      new THREE.MeshBasicMaterial({ map: dayNightTexture, transparent: true, depthWrite: false, fog: false }),
     );
     dayNightMesh.rotation.x = -Math.PI / 2;
     dayNightMesh.position.y = 0.05; // just above the base disc, avoids z-fighting
