@@ -365,6 +365,18 @@ function buildWallFadeTexture(): THREE.CanvasTexture {
   return new THREE.CanvasTexture(canvas);
 }
 
+// Bounds how many tile Image() loads (and therefore how many concurrent
+// requests to this add-on's own imagery-relay backend, which itself proxies
+// to NASA GIBS on a cache miss) are in flight at once. Three layers
+// (blue-marble/city-lights/shaded-relief) fetch in parallel via
+// Promise.all, so real concurrency is roughly 3x this. Needed because
+// firing the whole grid unbounded worked fine at zoom 4 (256 tiles/layer,
+// ~768 total) but started failing outright (net::ERR_FAILED, not a GIBS
+// error -- confirmed the same coordinates 200 directly against GIBS) once
+// the zoom-5 bump (1024 tiles/layer, ~3072 total) overwhelmed either the
+// relay running on a Pi or its outbound connection pool.
+const TILE_FETCH_CONCURRENCY = 16;
+
 async function fetchAssembledMercatorCanvas(
   zoom: number,
   tileUrlFn: (x: number, y: number, level: number) => string = nasaBlueMarbleTileUrl,
@@ -374,25 +386,38 @@ async function fetchAssembledMercatorCanvas(
   const canvas = document.createElement('canvas');
   canvas.width = tilesPerSide * tileSize;
   canvas.height = tilesPerSide * tileSize;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return canvas;
+  const context = canvas.getContext('2d');
+  if (!context) return canvas;
+
+  const coords: [number, number][] = [];
+  for (let tx = 0; tx < tilesPerSide; tx++) {
+    for (let ty = 0; ty < tilesPerSide; ty++) coords.push([tx, ty]);
+  }
+
+  function loadTile(tx: number, ty: number, ctx: CanvasRenderingContext2D): Promise<void> {
+    const url = tileUrlFn(tx, ty, zoom);
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.referrerPolicy = 'no-referrer';
+      img.onload = () => { ctx.drawImage(img, tx * tileSize, ty * tileSize); resolve(); };
+      // A missing/failed tile just leaves that patch blank rather than
+      // failing the whole reprojection -- most of GIBS' grid resolves fine.
+      img.onerror = () => resolve();
+      img.src = url;
+    });
+  }
 
   const loads: Promise<void>[] = [];
-  for (let tx = 0; tx < tilesPerSide; tx++) {
-    for (let ty = 0; ty < tilesPerSide; ty++) {
-      const url = tileUrlFn(tx, ty, zoom);
-      loads.push(new Promise((resolve) => {
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.referrerPolicy = 'no-referrer';
-        img.onload = () => { ctx.drawImage(img, tx * tileSize, ty * tileSize); resolve(); };
-        // A missing/failed tile just leaves that patch blank rather than
-        // failing the whole reprojection -- most of GIBS' grid resolves fine.
-        img.onerror = () => resolve();
-        img.src = url;
-      }));
+  let next = 0;
+  const workers = Array.from({ length: Math.min(TILE_FETCH_CONCURRENCY, coords.length) }, async () => {
+    while (next < coords.length) {
+      const coord = coords[next++];
+      if (!coord) break;
+      await loadTile(coord[0], coord[1], context);
     }
-  }
+  });
+  loads.push(...workers);
   await Promise.all(loads);
   return canvas;
 }
@@ -875,7 +900,15 @@ export class FlatEarthView {
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(0, 0, 0);
-    controls.minDistance = DISC_RADIUS * 0.3;
+    // Was 0.3 -- far more conservative than the 3D globe (GlobeMap.ts's
+    // OrbitControls: minDistance 101 against a ~100-unit globe radius, i.e.
+    // ~1% of radius above the surface) allows. 0.08 brings the disc's
+    // relative zoom-in range much closer to that, though not all the way:
+    // past a certain point the baked disc texture (see TEXTURE_SIZE/
+    // NASA_TILE_ZOOM above) is still a fixed-resolution whole-globe bake,
+    // not a real per-zoom tile LOD system like the globe has, so the very
+    // closest zoom will read softer than the equivalent 3D globe zoom.
+    controls.minDistance = DISC_RADIUS * 0.08;
     controls.maxDistance = DISC_RADIUS * 3;
     // Stop just above the horizon -- keeps the camera from dipping below the
     // disc plane and looking at the underside of the whole scene.
