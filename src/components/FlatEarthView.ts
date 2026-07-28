@@ -631,7 +631,7 @@ export class FlatEarthView {
     this.tooltipEl = tooltip;
 
     try {
-      await this.initScene(viewport, subsolar, sublunar);
+      await this.initScene(viewport, subsolar, sublunar, moonPhase);
       status.remove();
     } catch (err) {
       console.warn('[FlatEarthView] failed to initialize', err);
@@ -691,7 +691,12 @@ export class FlatEarthView {
     this.satelliteStopFn = null;
   }
 
-  private async initScene(viewport: HTMLElement, subsolar: { lat: number; lon: number }, sublunar: { lat: number; lon: number }): Promise<void> {
+  private async initScene(
+    viewport: HTMLElement,
+    subsolar: { lat: number; lon: number },
+    sublunar: { lat: number; lon: number },
+    moonPhase: { phaseFraction: number; illuminatedFraction: number; phaseName: string; waxing: boolean },
+  ): Promise<void> {
     const width = Math.max(1, viewport.clientWidth);
     const height = Math.max(1, viewport.clientHeight);
 
@@ -779,9 +784,21 @@ export class FlatEarthView {
     scene.add(sunMoonGroup);
     this.sunMoonGroup = sunMoonGroup;
 
+    // fog:false on both -- at SUN_DISTANCE/MOON_DISTANCE (300/150 units),
+    // the scene's own fog was blending them so far toward the near-black
+    // background that toggling this layer had no visible effect: the
+    // sky spheres were already almost invisible whether the layer was on
+    // or off. Also: neither previously had any marker on the disc itself
+    // (unlike every other layer's glyph convention), so there was nothing
+    // reliably in view to notice regardless of camera orientation -- the
+    // sky spheres sit far outside the default framing whenever the real
+    // subsolar/sublunar direction doesn't happen to point where the camera
+    // starts out looking. The ground markers below fix that: they sit on
+    // the disc itself, inside the default camera framing like every other
+    // layer's markers.
     const sunMesh = new THREE.Mesh(
       new THREE.SphereGeometry(8, 24, 24),
-      new THREE.MeshBasicMaterial({ color: 0xfff4d6 }),
+      new THREE.MeshBasicMaterial({ color: 0xfff4d6, fog: false }),
     );
     sunMesh.position.copy(sunPos);
     sunMoonGroup.add(sunMesh);
@@ -797,10 +814,35 @@ export class FlatEarthView {
     const moonPos = skyPosition(sublunar.lat, sublunar.lon, MOON_DISTANCE);
     const moonMesh = new THREE.Mesh(
       new THREE.SphereGeometry(4, 24, 24),
-      new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.9, metalness: 0 }),
+      new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.9, metalness: 0, fog: false }),
     );
     moonMesh.position.copy(moonPos);
     sunMoonGroup.add(moonMesh);
+
+    // Ground-point glyph markers -- same CSS2DObject convention every other
+    // layer uses, at the subsolar/sublunar point directly below each sky
+    // object, so there's always something to see on the disc itself
+    // regardless of where the sky spheres land relative to the camera.
+    const sunGlyphEl = this.buildMarkerElement('☀️', 0xfff4d6);
+    sunGlyphEl.addEventListener('click', (e) => this.showTooltip(e, {
+      title: 'Sun',
+      lines: [`Subsolar point: ${subsolar.lat.toFixed(1)}°, ${subsolar.lon.toFixed(1)}°`],
+    }));
+    const sunGlyph = new CSS2DObject(sunGlyphEl);
+    sunGlyph.position.copy(localToWorld(projectLonLatLocal(subsolar.lon, subsolar.lat)));
+    sunMoonGroup.add(sunGlyph);
+
+    const moonGlyphEl = this.buildMarkerElement(moonPhaseEmoji(moonPhase.phaseName), 0xcccccc);
+    moonGlyphEl.addEventListener('click', (e) => this.showTooltip(e, {
+      title: 'Moon',
+      lines: [
+        `${moonPhase.phaseName} · ${Math.round(moonPhase.illuminatedFraction * 100)}% illuminated`,
+        `Sublunar point: ${sublunar.lat.toFixed(1)}°, ${sublunar.lon.toFixed(1)}°`,
+      ],
+    }));
+    const moonGlyph = new CSS2DObject(moonGlyphEl);
+    moonGlyph.position.copy(localToWorld(projectLonLatLocal(sublunar.lon, sublunar.lat)));
+    sunMoonGroup.add(moonGlyph);
 
     // Day/night shading -- a thin transparent disc floating just above the
     // base disc, darkening the night side based on real solar elevation at
