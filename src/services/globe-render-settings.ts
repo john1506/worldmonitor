@@ -126,6 +126,16 @@ export function nasaCityLightsTileUrl(x: number, y: number, level: number): stri
   return toIngressAwareApiPath(`/api/imagery-watch/v1/nasa-tiles/city-lights/${level}/${x}/${y}.jpg`);
 }
 
+// GIBS' BlueMarble_ShadedRelief layer -- Blue Marble imagery pre-lit against
+// real terrain elevation (visible mountain shadows, snow, valleys). Used as
+// a relief-shading source, not a base texture: FlatEarthView derives a
+// grayscale darkening-only overlay from its luminance (see
+// buildReliefShadingTexture) rather than showing this layer's own colors
+// directly, so real basemap colors stay intact.
+export function nasaShadedReliefTileUrl(x: number, y: number, level: number): string {
+  return toIngressAwareApiPath(`/api/imagery-watch/v1/nasa-tiles/shaded-relief/${level}/${x}/${y}.jpg`);
+}
+
 export function getGlobeTexture(): GlobeTexture {
   try {
     const raw = localStorage.getItem(TEXTURE_STORAGE_KEY);

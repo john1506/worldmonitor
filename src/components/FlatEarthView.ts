@@ -4,7 +4,7 @@ import { CSS2DObject, CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRe
 import { h, clearChildren } from '@/utils/dom-utils';
 import { getCountriesGeoJson, getCountryAtCoordinates, getCountryNameByCode } from '@/services/country-geometry';
 import { fetchUcdpEvents } from '@/services/conflict';
-import { nasaBlueMarbleTileUrl, nasaCityLightsTileUrl, NASA_GIBS_MAX_LEVEL } from '@/services/globe-render-settings';
+import { nasaBlueMarbleTileUrl, nasaCityLightsTileUrl, nasaShadedReliefTileUrl, NASA_GIBS_MAX_LEVEL } from '@/services/globe-render-settings';
 import { fetchEarthquakes } from '@/services/earthquakes';
 import { fetchGpsInterference } from '@/services/gps-interference';
 import type { GpsJamHex } from '@/services/gps-interference';
@@ -60,7 +60,7 @@ const ALL_LAYER_KEYS = [
   'conflicts', 'conflictZones', 'hotspots', 'militaryBases', 'nuclear',
   'irradiators', 'spaceports', 'minerals', 'economic', 'waterways',
   'cables', 'pipelines', 'earthquakes', 'gpsJamming', 'radiationWatch',
-  'satellites', 'sunMoon', 'dayNight',
+  'satellites', 'sunMoon', 'dayNight', 'reliefShading',
 ] as const;
 
 // `lines` -- not a single `detail` string -- so every layer can surface the
@@ -377,8 +377,13 @@ async function fetchAssembledMercatorCanvas(
 // day/night shading and sun/moon positions need to reflect whatever time it
 // actually is on each open, so those still get recomputed fresh every time,
 // just reusing this same underlying imagery.
-const tileImageryCache: { zoom: number | null; blueMarble: HTMLCanvasElement | null; cityLights: HTMLCanvasElement | null } = {
-  zoom: null, blueMarble: null, cityLights: null,
+const tileImageryCache: {
+  zoom: number | null;
+  blueMarble: HTMLCanvasElement | null;
+  cityLights: HTMLCanvasElement | null;
+  shadedRelief: HTMLCanvasElement | null;
+} = {
+  zoom: null, blueMarble: null, cityLights: null, shadedRelief: null,
 };
 
 // Persisted to IndexedDB (survives a full page reload / new tab, unlike the
@@ -445,23 +450,29 @@ async function savePersistedCanvas(key: string, canvas: HTMLCanvasElement): Prom
   }
 }
 
-async function getCachedTileImagery(zoom: number): Promise<{ blueMarble: HTMLCanvasElement | null; cityLights: HTMLCanvasElement | null }> {
-  if (tileImageryCache.zoom === zoom && (tileImageryCache.blueMarble || tileImageryCache.cityLights)) {
-    return { blueMarble: tileImageryCache.blueMarble, cityLights: tileImageryCache.cityLights };
+async function getCachedTileImagery(zoom: number): Promise<{
+  blueMarble: HTMLCanvasElement | null;
+  cityLights: HTMLCanvasElement | null;
+  shadedRelief: HTMLCanvasElement | null;
+}> {
+  if (tileImageryCache.zoom === zoom && (tileImageryCache.blueMarble || tileImageryCache.cityLights || tileImageryCache.shadedRelief)) {
+    return { blueMarble: tileImageryCache.blueMarble, cityLights: tileImageryCache.cityLights, shadedRelief: tileImageryCache.shadedRelief };
   }
 
-  const [persistedBlueMarble, persistedCityLights] = await Promise.all([
+  const [persistedBlueMarble, persistedCityLights, persistedShadedRelief] = await Promise.all([
     loadPersistedCanvas(`blueMarble-z${zoom}`),
     loadPersistedCanvas(`cityLights-z${zoom}`),
+    loadPersistedCanvas(`shadedRelief-z${zoom}`),
   ]);
-  if (persistedBlueMarble || persistedCityLights) {
+  if (persistedBlueMarble || persistedCityLights || persistedShadedRelief) {
     tileImageryCache.zoom = zoom;
     tileImageryCache.blueMarble = persistedBlueMarble;
     tileImageryCache.cityLights = persistedCityLights;
-    return { blueMarble: persistedBlueMarble, cityLights: persistedCityLights };
+    tileImageryCache.shadedRelief = persistedShadedRelief;
+    return { blueMarble: persistedBlueMarble, cityLights: persistedCityLights, shadedRelief: persistedShadedRelief };
   }
 
-  const [blueMarble, cityLights] = await Promise.all([
+  const [blueMarble, cityLights, shadedRelief] = await Promise.all([
     fetchAssembledMercatorCanvas(zoom, nasaBlueMarbleTileUrl).catch((err) => {
       console.warn('[FlatEarthView] failed to load NASA Blue Marble tiles', err);
       return null;
@@ -470,13 +481,19 @@ async function getCachedTileImagery(zoom: number): Promise<{ blueMarble: HTMLCan
       console.warn('[FlatEarthView] failed to load NASA city-lights tiles', err);
       return null;
     }),
+    fetchAssembledMercatorCanvas(zoom, nasaShadedReliefTileUrl).catch((err) => {
+      console.warn('[FlatEarthView] failed to load NASA shaded-relief tiles', err);
+      return null;
+    }),
   ]);
   tileImageryCache.zoom = zoom;
   tileImageryCache.blueMarble = blueMarble;
   tileImageryCache.cityLights = cityLights;
+  tileImageryCache.shadedRelief = shadedRelief;
   if (blueMarble) void savePersistedCanvas(`blueMarble-z${zoom}`, blueMarble);
   if (cityLights) void savePersistedCanvas(`cityLights-z${zoom}`, cityLights);
-  return { blueMarble, cityLights };
+  if (shadedRelief) void savePersistedCanvas(`shadedRelief-z${zoom}`, shadedRelief);
+  return { blueMarble, cityLights, shadedRelief };
 }
 
 // Shared by every place that needs a single pixel out of an assembled Web
@@ -541,6 +558,74 @@ function reprojectMercatorToAzimuthal(source: HTMLCanvasElement, outSize: number
   return out;
 }
 
+// A grayscale "how much to darken this point" multiplier, derived from real
+// terrain elevation via NASA GIBS' BlueMarble_ShadedRelief layer (Blue
+// Marble imagery pre-lit against actual elevation data -- visible mountain
+// shadows, snow, valleys) rather than showing that layer's own colors
+// directly. Applied as a THREE.MultiplyBlending overlay on top of the plain
+// (unlit, true-color) base disc, so real basemap colors stay intact and
+// this only adds a relief cue on top -- same reasoning as the day/night
+// overlay being a separate mesh rather than baked into the base texture.
+//
+// MultiplyBlending can only ever darken a base color, never brighten past
+// it (values >1 aren't representable) -- so this only encodes the
+// "recessed/shadowed" half of relief shading (valleys, shadowed slopes read
+// darker), not a brightening pass for sunlit ridges/snow. That's still the
+// dominant real-world legibility cue for reading terrain height
+// differences, and keeping this a single overlay mesh (instead of adding a
+// second additive-blended one for the brightening half) matches how much
+// visual payoff this "just for fun" view needs for the complexity cost.
+function buildReliefShadingTexture(shadedReliefCanvas: HTMLCanvasElement | null, outSize: number): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = outSize;
+  canvas.height = outSize;
+  const ctx = canvas.getContext('2d');
+  if (!ctx || !shadedReliefCanvas) return new THREE.CanvasTexture(canvas);
+  const srcCtx = shadedReliefCanvas.getContext('2d');
+  if (!srcCtx) return new THREE.CanvasTexture(canvas);
+  const srcData = srcCtx.getImageData(0, 0, shadedReliefCanvas.width, shadedReliefCanvas.height);
+
+  const out = ctx.createImageData(outSize, outSize);
+  const center = outSize / 2;
+  const maxLatRad = (MERCATOR_MAX_LAT * Math.PI) / 180;
+  // BlueMarble_ShadedRelief's brightest features (snow, ice) consistently
+  // land near this luminance across the whole global dataset -- pixels at
+  // or above it multiply by 1 (no darkening); darker relief shading scales
+  // down from there. Floored at MIN_FACTOR so deep-shadow/ocean areas don't
+  // multiply the base imagery all the way to black.
+  const PEAK_LUMINANCE = 245;
+  const MIN_FACTOR = 0.35;
+
+  for (let oy = 0; oy < outSize; oy++) {
+    for (let ox = 0; ox < outSize; ox++) {
+      const dx = ox - center;
+      const dy = oy - center;
+      const rho = Math.sqrt(dx * dx + dy * dy);
+      const outIdx = (oy * outSize + ox) * 4;
+      if (rho > center) continue;
+
+      let pixelValue = 255; // no darkening outside Mercator's coverage (poles/ice wall)
+      const lonRad = Math.atan2(dx, dy);
+      const latRad = Math.PI / 2 - (rho / center) * Math.PI;
+      if (latRad <= maxLatRad && latRad >= -maxLatRad) {
+        const [r, g, b] = sampleMercatorPixel(srcData, lonRad, latRad);
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        const factor = Math.max(MIN_FACTOR, Math.min(1, lum / PEAK_LUMINANCE));
+        pixelValue = Math.round(factor * 255);
+      }
+
+      out.data[outIdx] = pixelValue;
+      out.data[outIdx + 1] = pixelValue;
+      out.data[outIdx + 2] = pixelValue;
+      out.data[outIdx + 3] = 255;
+    }
+  }
+  ctx.putImageData(out, 0, 0);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.flipY = false; // matches the base disc's UV convention
+  return texture;
+}
+
 // ─── Live-layer caching ─────────────────────────────────────────────────────
 // Persists each live-fetched layer's data in sessionStorage (survives a page
 // reload within the tab, not just an open/close of the view) so reopening
@@ -588,6 +673,7 @@ export class FlatEarthView {
   private tooltipEl: HTMLElement | null = null;
   private sunMoonGroup: THREE.Group | null = null;
   private dayNightMesh: THREE.Mesh | null = null;
+  private reliefMesh: THREE.Mesh | null = null;
   // Every toggleable layer's Object3D, keyed the same as `layers` below --
   // lets setLayerEnabled() stay a one-line generic toggle instead of a long
   // if-chain as more layers get added.
@@ -699,6 +785,7 @@ export class FlatEarthView {
     this.tooltipEl = null;
     this.sunMoonGroup = null;
     this.dayNightMesh = null;
+    this.reliefMesh = null;
     this.layerObjects = {};
     this.refreshTimer = null;
     this.satelliteStopFn = null;
@@ -775,10 +862,10 @@ export class FlatEarthView {
     scene.add(sunLight.target);
 
     // Cached in memory across open/close cycles (see getCachedTileImagery) --
-    // reused for both the base disc texture and the day/night overlay's
-    // city-lights/ocean-glint blending below.
+    // reused for the base disc texture, the day/night overlay's city-lights/
+    // ocean-glint blending, and the relief-shading overlay below.
     const tileZoom = Math.min(NASA_TILE_ZOOM, NASA_GIBS_MAX_LEVEL);
-    const { blueMarble: blueMarbleCanvas, cityLights: cityLightsCanvas } = await getCachedTileImagery(tileZoom);
+    const { blueMarble: blueMarbleCanvas, cityLights: cityLightsCanvas, shadedRelief: shadedReliefCanvas } = await getCachedTileImagery(tileZoom);
 
     const { texture, geometry } = await this.buildDisc(blueMarbleCanvas);
     // Unlit (MeshBasicMaterial), not MeshStandardMaterial: the dedicated
@@ -793,6 +880,24 @@ export class FlatEarthView {
     const disc = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: texture, fog: false }));
     disc.rotation.x = -Math.PI / 2;
     scene.add(disc);
+
+    // Relief shading -- a thin MultiplyBlending overlay (real terrain
+    // elevation, via NASA's BlueMarble_ShadedRelief) that darkens shadowed
+    // slopes/valleys against the plain basemap underneath, so height
+    // differences actually read visually instead of the disc looking
+    // uniformly flat. Sits just above the base disc and below the day/night
+    // overlay -- see buildReliefShadingTexture for why this is multiply-only
+    // (darkening, not brightening) and toggleable independently.
+    const reliefTexture = buildReliefShadingTexture(shadedReliefCanvas, TEXTURE_SIZE);
+    const reliefMesh = new THREE.Mesh(
+      geometry.clone(),
+      new THREE.MeshBasicMaterial({ map: reliefTexture, transparent: true, depthWrite: false, fog: false, blending: THREE.MultiplyBlending }),
+    );
+    reliefMesh.rotation.x = -Math.PI / 2;
+    reliefMesh.position.y = 0.02; // above the base disc (0), below the day/night overlay (0.05)
+    reliefMesh.visible = this.layers.reliefShading !== false;
+    scene.add(reliefMesh);
+    this.reliefMesh = reliefMesh;
 
     const sunMoonGroup = new THREE.Group();
     sunMoonGroup.visible = this.layers.sunMoon !== false;
@@ -950,6 +1055,7 @@ export class FlatEarthView {
       { key: 'satellites', label: '\u{1F6F0}️ Satellites (live, animated)' },
       { key: 'sunMoon', label: '☀️ Sun & Moon' },
       { key: 'dayNight', label: '\u{1F317} Day / night shading' },
+      { key: 'reliefShading', label: '\u{26F0}️ Relief shading' },
     ];
     const rowElements: HTMLElement[] = [];
     for (const { key, label } of rows) {
@@ -1006,6 +1112,7 @@ export class FlatEarthView {
     if (obj) obj.visible = enabled;
     if (key === 'sunMoon' && this.sunMoonGroup) this.sunMoonGroup.visible = enabled;
     if (key === 'dayNight' && this.dayNightMesh) this.dayNightMesh.visible = enabled;
+    if (key === 'reliefShading' && this.reliefMesh) this.reliefMesh.visible = enabled;
   }
 
   private handleResize(viewport: HTMLElement): void {
