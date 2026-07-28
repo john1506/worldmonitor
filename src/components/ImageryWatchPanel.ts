@@ -5,6 +5,7 @@ import { h, clearChildren } from '@/utils/dom-utils';
 import { escapeHtml } from '@/utils/sanitize';
 import { ImageryCogViewer, GAP_WARNING_DAYS } from './ImageryCogViewer';
 import { fetchUcdpEvents } from '@/services/conflict';
+import { resolvePreviewImageSrc } from '@/utils/imagery-preview';
 import type { ImageryWatchAreaPin } from '@/types';
 
 interface ImageryArea {
@@ -327,7 +328,7 @@ export class ImageryWatchPanel extends Panel {
           },
         },
           latest?.previewUrl
-            ? h('img', { src: latest.previewUrl, loading: 'lazy', referrerpolicy: 'no-referrer', alt: `${escapeHtml(area.name)} latest capture` })
+            ? h('img', { src: resolvePreviewImageSrc(latest.previewUrl), loading: 'lazy', referrerpolicy: 'no-referrer', alt: `${escapeHtml(area.name)} latest capture` })
             : h('div', { className: 'imagery-watch-area-thumb-empty' }, '...'),
         ),
         h('div', { className: 'imagery-watch-area-meta' },
@@ -513,7 +514,7 @@ export class ImageryWatchPanel extends Panel {
           },
         },
           scene.previewUrl
-            ? h('img', { src: scene.previewUrl, loading: 'lazy', referrerpolicy: 'no-referrer', alt: '' })
+            ? h('img', { src: resolvePreviewImageSrc(scene.previewUrl), loading: 'lazy', referrerpolicy: 'no-referrer', alt: '' })
             : h('div', { className: 'imagery-watch-history-item-empty' }, scene.satellite),
           h('span', { className: 'imagery-watch-history-item-date' }, new Date(scene.datetime).toLocaleDateString()),
           ...(flagged ? [h('span', { className: 'imagery-watch-history-item-gap', title: `${Math.round(gapDays)} day gap since previous capture` }, '⚠ gap')] : []),

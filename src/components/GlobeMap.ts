@@ -57,7 +57,7 @@ import type { GpsJamHex } from '@/services/gps-interference';
 import type { SatellitePosition } from '@/services/satellites';
 import type { ImageryScene } from '@/generated/server/worldmonitor/imagery/v1/service_server';
 import type { ImageryWatchAreaPin } from '@/types';
-import { isAllowedPreviewUrl } from '@/utils/imagery-preview';
+import { isAllowedPreviewUrl, resolvePreviewImageSrc } from '@/utils/imagery-preview';
 import { getCategoryStyle } from '@/services/webcams';
 import { pinWebcam, isPinned } from '@/services/webcams/pinned-store';
 import type { WebcamEntry, WebcamCluster } from '@/generated/client/worldmonitor/webcam/v1/service_client';
@@ -934,7 +934,7 @@ export class GlobeMap {
             label += `<br><span style="opacity:.5;">Res: ${parts.join(' \u00B7 ')}</span>`;
           }
           if (isAllowedPreviewUrl(d.previewUrl)) {
-            const safeHref = escapeHtml(new URL(d.previewUrl!).href);
+            const safeHref = escapeHtml(resolvePreviewImageSrc(d.previewUrl!));
             label += `<br><img src="${safeHref}" referrerpolicy="no-referrer" style="max-width:180px;max-height:120px;margin-top:4px;border-radius:4px;" class="imagery-preview">`;
           }
           return label;
@@ -1650,7 +1650,7 @@ export class GlobeMap {
         html += `<br><span style="opacity:.5;">Res: ${rp.join(' \u00B7 ')}</span>`;
       }
       if (isAllowedPreviewUrl(d.previewUrl)) {
-        const safeHref = escapeHtml(new URL(d.previewUrl!).href);
+        const safeHref = escapeHtml(resolvePreviewImageSrc(d.previewUrl!));
         html += `<br><img src="${safeHref}" referrerpolicy="no-referrer" style="max-width:180px;max-height:120px;margin-top:4px;border-radius:4px;" class="imagery-preview">`;
       }
     } else if (d._kind === 'imageryWatchArea') {
@@ -1660,7 +1660,7 @@ export class GlobeMap {
         html += `<br><span style="opacity:.5;">Latest: ${esc(new Date(d.latestDatetime).toLocaleString())}</span>`;
       }
       if (isAllowedPreviewUrl(d.latestPreviewUrl ?? undefined)) {
-        const safeHref = escapeHtml(new URL(d.latestPreviewUrl!).href);
+        const safeHref = escapeHtml(resolvePreviewImageSrc(d.latestPreviewUrl!));
         html += `<br><img src="${safeHref}" referrerpolicy="no-referrer" style="max-width:180px;max-height:120px;margin-top:4px;border-radius:4px;" class="imagery-preview">`;
       }
     } else if (d._kind === 'webcam') {

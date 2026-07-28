@@ -44,8 +44,19 @@ const DISC_RADIUS = 50;
 const WALL_HEIGHT = 3.5; // was 9 -- read as a giant tower rather than a modest ice ridge
 const WALL_THICKNESS = 2.2;
 const WALL_TAPER = 1.5; // base this much wider than the top -- a sloped profile instead of a sheer vertical cylinder
-const TEXTURE_SIZE = 2048;
-const NASA_TILE_ZOOM = 4; // 16x16 tiles -- 2x oversampled vs. TEXTURE_SIZE, meaningfully sharper than 1:1
+// Was 2048/zoom-4 (16x16 tiles). At controls.minDistance (0.3 * DISC_RADIUS),
+// the camera's visible slice of the disc is roughly an eighth of its
+// diameter, so that whole-globe-in-one-texture bake was only contributing
+// ~250px of real source detail across the screen at closest zoom -- visibly
+// blocky/smeared (see the zoomed-in disc screenshots that prompted this).
+// Doubling both keeps the same 2x oversample ratio (32x32 tiles = 8192px
+// source vs 4096px output) while roughly doubling the source pixels
+// available per screen pixel at max zoom-in. NASA_GIBS_MAX_LEVEL is 8, so
+// zoom 5 has headroom left; the nearest-neighbor reprojection below is a
+// one-time O(TEXTURE_SIZE^2) cost per view-open (~4x pixels vs before), not
+// per-frame, so this doesn't touch render-loop performance.
+const TEXTURE_SIZE = 4096;
+const NASA_TILE_ZOOM = 5;
 const MERCATOR_MAX_LAT = 85.0511; // Web Mercator/GIBS' standard valid latitude bound
 const MARKER_ALTITUDE = 0.4; // slightly above the disc surface, avoids z-fighting
 const SUN_DISTANCE = 300;
@@ -913,7 +924,14 @@ export class FlatEarthView {
     const reliefTexture = buildReliefShadingTexture(shadedReliefCanvas, TEXTURE_SIZE);
     const reliefMesh = new THREE.Mesh(
       geometry.clone(),
-      new THREE.MeshBasicMaterial({ map: reliefTexture, transparent: true, depthWrite: false, fog: false, blending: THREE.MultiplyBlending }),
+      // premultipliedAlpha: true -- without it, three.js's WebGLState hits an
+      // error() branch for MultiplyBlending that logs every frame AND skips
+      // setting the GL blend function entirely, leaving stale blend state
+      // rather than actually applying the darkening. Safe here since this
+      // texture's alpha is always 255 wherever the mesh draws (see
+      // buildReliefShadingTexture), so premultiplied vs. straight alpha is
+      // identical -- this only fixes the blend-state bug, no visual change.
+      new THREE.MeshBasicMaterial({ map: reliefTexture, transparent: true, depthWrite: false, fog: false, blending: THREE.MultiplyBlending, premultipliedAlpha: true }),
     );
     reliefMesh.rotation.x = -Math.PI / 2;
     reliefMesh.position.y = 0.02; // above the base disc (0), below the day/night overlay (0.05)

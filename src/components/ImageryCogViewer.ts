@@ -1,4 +1,5 @@
 import { h } from '@/utils/dom-utils';
+import { resolvePreviewImageSrc } from '@/utils/imagery-preview';
 
 // Renders a Cloud-Optimized GeoTIFF scene (Sentinel-2's TCI.tif, NAIP's
 // image.tif) at a real resolution beyond the small preview JPEG, without a
@@ -132,7 +133,7 @@ async function loadAverageColor(url: string): Promise<[number, number, number] |
       }
     };
     img.onerror = () => resolve(null);
-    img.src = url;
+    img.src = resolvePreviewImageSrc(url);
   });
 }
 
@@ -508,8 +509,8 @@ export class ImageryCogViewer {
     const sceneA = this.scenes[this.compareIndexA];
     const sceneB = this.scenes[this.compareIndexB];
     if (!sceneA || !sceneB || !this.compareImgA || !this.compareImgB) return;
-    this.compareImgA.src = sceneA.previewUrl;
-    this.compareImgB.src = sceneB.previewUrl;
+    this.compareImgA.src = resolvePreviewImageSrc(sceneA.previewUrl);
+    this.compareImgB.src = resolvePreviewImageSrc(sceneB.previewUrl);
     if (this.compareLabelA) this.compareLabelA.textContent = `A · ${new Date(sceneA.datetime).toLocaleDateString()}`;
     if (this.compareLabelB) this.compareLabelB.textContent = `B · ${new Date(sceneB.datetime).toLocaleDateString()}`;
     this.applyCompareSplit();
@@ -658,7 +659,7 @@ export class ImageryCogViewer {
         resolve();
       };
       img.onerror = () => { status.textContent = 'Could not load any image for this capture.'; resolve(); };
-      img.src = scene.previewUrl;
+      img.src = resolvePreviewImageSrc(scene.previewUrl);
     });
   }
 }
