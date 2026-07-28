@@ -217,6 +217,92 @@ function satellitePosition(lat: number, lon: number, altKm: number): THREE.Vecto
   return new THREE.Vector3(local.x, height, -local.y);
 }
 
+// Same country->color mapping GlobeMap.ts's own satellite layer uses, so a
+// given satellite reads as the same color in both views.
+const SAT_COUNTRY_COLORS: Record<string, number> = {
+  CN: 0xff2020, RU: 0xff8800, US: 0x4488ff, EU: 0x44cc44,
+  KR: 0xaa66ff, IN: 0xff66aa, TR: 0xff4466, OTHER: 0xccccff,
+};
+
+const SAT_BEAM_RAY_COUNT = 6;
+const SAT_BEAM_GROUND_SPREAD = 2.5; // local-space units (DISC_RADIUS=50) -- footprint circle radius
+
+// The "shroud": a translucent visibility cone (ray outline + filled
+// triangle-fan mesh) flaring from each satellite's real elevated position
+// down to a small footprint circle on the ground directly beneath it --
+// same technique as GlobeMap.ts's rebuildSatBeams, adapted from sphere-
+// surface geometry to this view's flat local (x,y) plane. Rebuilt wholesale
+// on every propagation tick (like GlobeMap does) rather than updated in
+// place -- BufferGeometry doesn't lend itself to per-satellite incremental
+// updates, and satellite counts here are small enough (tens, not thousands)
+// for a full rebuild every 2s to be cheap.
+function buildSatelliteBeams(positions: SatellitePosition[]): THREE.Group {
+  const group = new THREE.Group();
+  const tmpColor = new THREE.Color();
+  const rayPositions: number[] = [];
+  const rayColors: number[] = [];
+  const conePositions: number[] = [];
+  const coneColors: number[] = [];
+
+  for (const pos of positions) {
+    if (!Number.isFinite(pos.lat) || !Number.isFinite(pos.lng)) continue;
+    const local = projectLonLatLocal(pos.lng, pos.lat);
+    const beamTop = satellitePosition(pos.lat, pos.lng, pos.alt);
+    const hex = SAT_COUNTRY_COLORS[pos.country] ?? 0xccccff;
+    tmpColor.setHex(hex);
+    const r = tmpColor.r, g = tmpColor.g, b = tmpColor.b;
+
+    const groundPts: THREE.Vector3[] = [];
+    for (let i = 0; i < SAT_BEAM_RAY_COUNT; i++) {
+      const angle = (i / SAT_BEAM_RAY_COUNT) * Math.PI * 2;
+      const gp = new THREE.Vector3(
+        local.x + Math.cos(angle) * SAT_BEAM_GROUND_SPREAD,
+        0.05,
+        -local.y + Math.sin(angle) * SAT_BEAM_GROUND_SPREAD,
+      );
+      groundPts.push(gp);
+      rayPositions.push(beamTop.x, beamTop.y, beamTop.z, gp.x, gp.y, gp.z);
+      rayColors.push(r, g, b, r * 0.3, g * 0.3, b * 0.3);
+    }
+    for (let i = 0; i < SAT_BEAM_RAY_COUNT; i++) {
+      const next = (i + 1) % SAT_BEAM_RAY_COUNT;
+      const gi = groundPts[i]!;
+      const gn = groundPts[next]!;
+      conePositions.push(
+        beamTop.x, beamTop.y, beamTop.z,
+        gi.x, gi.y, gi.z,
+        gn.x, gn.y, gn.z,
+      );
+      coneColors.push(r, g, b, r * 0.2, g * 0.2, b * 0.2, r * 0.2, g * 0.2, b * 0.2);
+    }
+  }
+
+  if (rayPositions.length > 0) {
+    const rayGeo = new THREE.BufferGeometry();
+    rayGeo.setAttribute('position', new THREE.Float32BufferAttribute(rayPositions, 3));
+    rayGeo.setAttribute('color', new THREE.Float32BufferAttribute(rayColors, 3));
+    const rayMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.55, depthWrite: false });
+    group.add(new THREE.LineSegments(rayGeo, rayMat));
+  }
+  if (conePositions.length > 0) {
+    const coneGeo = new THREE.BufferGeometry();
+    coneGeo.setAttribute('position', new THREE.Float32BufferAttribute(conePositions, 3));
+    coneGeo.setAttribute('color', new THREE.Float32BufferAttribute(coneColors, 3));
+    const coneMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.1, side: THREE.DoubleSide, depthWrite: false });
+    group.add(new THREE.Mesh(coneGeo, coneMat));
+  }
+  return group;
+}
+
+function disposeBeamGroup(group: THREE.Group): void {
+  group.traverse((child) => {
+    if (!(child instanceof THREE.Mesh) && !(child instanceof THREE.LineSegments)) return;
+    child.geometry.dispose();
+    const mats = Array.isArray(child.material) ? child.material : [child.material];
+    for (const mat of mats) mat.dispose();
+  });
+}
+
 // A grayscale vertical gradient for the wall's alphaMap (three.js reads
 // alphaMap as grayscale luminance, not the canvas's own alpha channel --
 // white = opaque, black = transparent), so the wall fades away into the fog
@@ -552,7 +638,10 @@ export class FlatEarthView {
     this.resizeObserver?.disconnect();
     this.controls?.dispose();
     this.scene?.traverse((obj) => {
-      if (!(obj instanceof THREE.Mesh)) return;
+      // Mesh covers most of the scene; LineSegments (the satellite beam
+      // rays) is a THREE.Line subtype, not a Mesh, but has the same
+      // geometry/material shape and needs the same disposal.
+      if (!(obj instanceof THREE.Mesh) && !(obj instanceof THREE.LineSegments)) return;
       obj.geometry.dispose();
       const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
       for (const mat of materials) {
@@ -840,6 +929,30 @@ export class FlatEarthView {
     return wrap;
   }
 
+  // Satellites get their own marker style (a small glowing dot, not an
+  // emoji glyph) to match GlobeMap.ts's satellite markers exactly.
+  private buildSatelliteDotElement(color: number): HTMLElement {
+    const c = cssColor(color);
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'width:16px;height:16px;display:flex;align-items:center;justify-content:center;pointer-events:auto;cursor:pointer;user-select:none;';
+    const dot = document.createElement('div');
+    dot.style.cssText = `width:5px;height:5px;border-radius:50%;background:${c};box-shadow:0 0 6px 2px ${c}88;`;
+    wrap.appendChild(dot);
+    return wrap;
+  }
+
+  // The ground "footprint" ring directly beneath each satellite -- same
+  // faint translucent-circle style GlobeMap.ts uses for its satFootprint
+  // markers. Not clickable (pointer-events:none): it's a passive visual
+  // anchor for the beam/shroud above it, the dot marker already handles
+  // clicks/tooltips.
+  private buildSatFootprintElement(color: number): HTMLElement {
+    const c = cssColor(color);
+    const el = document.createElement('div');
+    el.style.cssText = `width:12px;height:12px;border-radius:50%;border:1px solid ${c}66;background:${c}15;pointer-events:none;`;
+    return el;
+  }
+
   // Registers every layer this view knows about: static reference-data
   // layers render synchronously (no fetch involved, always available),
   // live-fetched layers go through the cache-then-refresh path below, and
@@ -903,46 +1016,63 @@ export class FlatEarthView {
   // functions, reused directly here). Unlike the other live layers, this
   // isn't cache-then-refresh-every-5-minutes: satellites genuinely move, so
   // marker positions get updated in place every few seconds via
-  // startPropagationLoop, reusing the same mesh per satellite rather than
-  // rebuilding the group each tick.
+  // startPropagationLoop, reusing the same dot/footprint per satellite
+  // rather than rebuilding the group each tick -- only the beam/shroud
+  // geometry (see buildSatelliteBeams) gets rebuilt wholesale each tick,
+  // matching GlobeMap.ts's own rebuildSatBeams.
   private async loadSatellites(scene: THREE.Scene): Promise<void> {
     const group = this.makeLayerGroup(scene, 'satellites');
+    let beamGroup: THREE.Group | null = null;
     try {
       const tles = await fetchSatelliteTLEs();
       if (!tles || tles.length === 0) return;
       const satRecs = await initSatRecs(tles);
-      // Tracks both the CSS2DObject and its latest known position/name/etc
-      // per satellite -- the click listener reads `latest` at click-time
-      // (via the Map, keyed by the closed-over noradId) rather than
-      // capturing a snapshot, so the tooltip always reflects the most
-      // recent propagated position even though the element itself is only
-      // created once.
-      const byNoradId = new Map<string, { obj: CSS2DObject; latest: SatellitePosition }>();
+      // Tracks the dot marker, ground footprint marker, and latest known
+      // position/name/etc per satellite -- the click listener reads
+      // `latest` at click-time (via the Map, keyed by the closed-over
+      // noradId) rather than capturing a snapshot, so the tooltip always
+      // reflects the most recent propagated position even though the
+      // element itself is only created once.
+      const byNoradId = new Map<string, { dot: CSS2DObject; footprint: CSS2DObject; latest: SatellitePosition }>();
 
       const render = (positions: SatellitePosition[]): void => {
         for (const pos of positions) {
           if (!Number.isFinite(pos.lat) || !Number.isFinite(pos.lng)) continue;
+          const color = SAT_COUNTRY_COLORS[pos.country] ?? 0xccccff;
           const world = satellitePosition(pos.lat, pos.lng, pos.alt);
+          const local = projectLonLatLocal(pos.lng, pos.lat);
           let entry = byNoradId.get(pos.noradId);
           if (!entry) {
-            const el = this.buildMarkerElement('\u{1F6F0}\u{FE0F}', 0x88ddff);
-            el.addEventListener('click', (e) => {
+            const dotEl = this.buildSatelliteDotElement(color);
+            dotEl.addEventListener('click', (e) => {
               const current = byNoradId.get(pos.noradId)?.latest;
               if (current) {
                 this.showTooltip(e, {
-                  title: current.name,
+                  title: `${current.name} (${current.country})`,
                   detail: `${current.type} · alt ${Math.round(current.alt)}km · ${current.velocity.toFixed(1)} km/s`,
                 });
               }
             });
-            const obj = new CSS2DObject(el);
-            group.add(obj);
-            entry = { obj, latest: pos };
+            const dot = new CSS2DObject(dotEl);
+            group.add(dot);
+
+            const footprint = new CSS2DObject(this.buildSatFootprintElement(color));
+            group.add(footprint);
+
+            entry = { dot, footprint, latest: pos };
             byNoradId.set(pos.noradId, entry);
           }
-          entry.obj.position.copy(world);
+          entry.dot.position.copy(world);
+          entry.footprint.position.set(local.x, 0.05, -local.y);
           entry.latest = pos;
         }
+
+        if (beamGroup) {
+          group.remove(beamGroup);
+          disposeBeamGroup(beamGroup);
+        }
+        beamGroup = buildSatelliteBeams(positions);
+        group.add(beamGroup);
       };
 
       render(propagatePositions(satRecs));
