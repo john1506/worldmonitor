@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { CSS2DObject, CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { h, clearChildren } from '@/utils/dom-utils';
-import { getCountriesGeoJson } from '@/services/country-geometry';
+import { getCountriesGeoJson, getCountryAtCoordinates, getCountryNameByCode } from '@/services/country-geometry';
 import { fetchUcdpEvents } from '@/services/conflict';
 import { nasaBlueMarbleTileUrl, nasaCityLightsTileUrl, NASA_GIBS_MAX_LEVEL } from '@/services/globe-render-settings';
 import { fetchEarthquakes } from '@/services/earthquakes';
@@ -63,9 +63,13 @@ const ALL_LAYER_KEYS = [
   'satellites', 'sunMoon', 'dayNight',
 ] as const;
 
+// `lines` -- not a single `detail` string -- so every layer can surface the
+// same breadth of fields the 3D/2D map's own tooltips show (operator,
+// status, historical context, etc.) instead of just one summary line.
+// Rendered via textContent (see showTooltip), so no HTML escaping needed.
 interface MarkerTooltipDatum {
   title: string;
-  detail: string;
+  lines: string[];
 }
 
 // Pre-rotation, geometry-local (x, y) in world-scale units -- the single
@@ -222,6 +226,16 @@ function satellitePosition(lat: number, lon: number, altKm: number): THREE.Vecto
 const SAT_COUNTRY_COLORS: Record<string, number> = {
   CN: 0xff2020, RU: 0xff8800, US: 0x4488ff, EU: 0x44cc44,
   KR: 0xaa66ff, IN: 0xff66aa, TR: 0xff4466, OTHER: 0xccccff,
+};
+
+// Same lookup tables GlobeMap.ts's own satellite tooltip uses, so the two
+// views agree on operator name/type label wording, not just marker color.
+const SAT_OPERATOR_NAME: Record<string, string> = {
+  CN: 'China', RU: 'Russia', US: 'United States', EU: 'ESA / EU',
+  KR: 'South Korea', IN: 'India', TR: 'Turkey', OTHER: 'Other',
+};
+const SAT_TYPE_LABEL: Record<string, string> = {
+  sar: 'SAR Imaging', optical: 'Optical Imaging', military: 'Military', sigint: 'SIGINT',
 };
 
 const SAT_BEAM_RAY_COUNT = 6;
@@ -928,10 +942,12 @@ export class FlatEarthView {
     clearChildren(this.tooltipEl);
     const strong = document.createElement('strong');
     strong.textContent = datum.title;
-    const line = document.createElement('div');
-    line.textContent = datum.detail;
     this.tooltipEl.appendChild(strong);
-    this.tooltipEl.appendChild(line);
+    for (const text of datum.lines) {
+      const line = document.createElement('div');
+      line.textContent = text;
+      this.tooltipEl.appendChild(line);
+    }
   }
 
   // Same visual convention GlobeMap.ts's own glyph markers use: a small
@@ -982,21 +998,61 @@ export class FlatEarthView {
   // day/night overlay already does.
   private initLayers(scene: THREE.Scene, geometry: THREE.CircleGeometry): void {
     this.addStaticLayer(scene, 'hotspots', INTEL_HOTSPOTS, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1F3AF}', 0xffaa00,
-      (d) => ({ title: d.name, detail: d.location ?? d.subtext ?? '' }));
+      (d) => ({
+        title: d.name,
+        lines: [
+          d.location ?? d.subtext ?? '',
+          d.level ? `Level: ${d.level}` : '',
+          d.status ?? '',
+          d.agencies?.length ? `Agencies: ${d.agencies.join(', ')}` : '',
+          d.description ?? '',
+          d.whyItMatters ? `Why it matters: ${d.whyItMatters}` : '',
+        ].filter(Boolean),
+      }));
     this.addStaticLayer(scene, 'militaryBases', MILITARY_BASES, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1FA96}', 0x6699ff,
-      (d) => ({ title: d.name, detail: [d.country, d.arm].filter(Boolean).join(' · ') }));
+      (d) => ({
+        title: d.name,
+        lines: [
+          [d.country, d.arm].filter(Boolean).join(' · '),
+          d.status ? `Status: ${d.status}` : '',
+          d.description ?? '',
+        ].filter(Boolean),
+      }));
     this.addStaticLayer(scene, 'nuclear', NUCLEAR_FACILITIES, (d) => ({ lat: d.lat, lon: d.lon }), '☢️', 0xffdd00,
-      (d) => ({ title: d.name, detail: `${d.type} · ${d.status}` }));
+      (d) => ({
+        title: d.name,
+        lines: [
+          `${d.type} · ${d.status}`,
+          d.operator ? `Operator: ${d.operator}` : '',
+          d.operationalSince ? `Operational since: ${d.operationalSince}` : '',
+          d.iaeaStatus ? `IAEA status: ${d.iaeaStatus}` : '',
+          d.treaties?.length ? `Treaties: ${d.treaties.join(', ')}` : '',
+          d.keyEvents?.length ? `Key events: ${d.keyEvents.join('; ')}` : '',
+        ].filter(Boolean),
+      }));
     this.addStaticLayer(scene, 'irradiators', GAMMA_IRRADIATORS, (d) => ({ lat: d.lat, lon: d.lon }), '☣️', 0xaaff00,
-      (d) => ({ title: d.city, detail: d.country }));
+      (d) => ({ title: d.city, lines: [d.country, d.organization ? `Operator: ${d.organization}` : ''].filter(Boolean) }));
     this.addStaticLayer(scene, 'spaceports', SPACEPORTS, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1F680}', 0xff66ff,
-      (d) => ({ title: d.name, detail: `${d.country} · ${d.status}` }));
+      (d) => ({
+        title: d.name,
+        lines: [`${d.country} · ${d.status}`, `Operator: ${d.operator}`, `Launch frequency: ${d.launches}`],
+      }));
     this.addStaticLayer(scene, 'minerals', CRITICAL_MINERALS, (d) => ({ lat: d.lat, lon: d.lon }), '⛏️', 0x00ffcc,
-      (d) => ({ title: d.name, detail: `${d.mineral} · ${d.country}` }));
+      (d) => ({
+        title: d.name,
+        lines: [`${d.mineral} · ${d.country}`, `Operator: ${d.operator}`, `Status: ${d.status}`, d.significance ?? ''].filter(Boolean),
+      }));
     this.addStaticLayer(scene, 'economic', ECONOMIC_CENTERS, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1F4B9}', 0x44ff88,
-      (d) => ({ title: d.name, detail: d.country }));
+      (d) => ({
+        title: d.name,
+        lines: [
+          `${d.type} · ${d.country}`,
+          d.marketHours ? `Hours: ${d.marketHours.open}–${d.marketHours.close} (${d.marketHours.timezone})` : '',
+          d.description ?? '',
+        ].filter(Boolean),
+      }));
     this.addStaticLayer(scene, 'waterways', STRATEGIC_WATERWAYS, (d) => ({ lat: d.lat, lon: d.lon }), '\u{1F30A}', 0x00ccff,
-      (d) => ({ title: d.name, detail: d.description ?? '' }));
+      (d) => ({ title: d.name, lines: [d.description ?? ''].filter(Boolean) }));
 
     const earthquakeGroup = this.makeLayerGroup(scene, 'earthquakes');
     const gpsJamGroup = this.makeLayerGroup(scene, 'gpsJamming');
@@ -1004,19 +1060,51 @@ export class FlatEarthView {
     const conflictGroup = this.makeLayerGroup(scene, 'conflicts');
 
     const refreshAll = (): void => {
+      // '〽' (not the 🌍 globe emoji this used to use) -- same earthquake
+      // glyph convention GlobeMap.ts's own natural-disaster layer uses;
+      // 🌍 read as an odd choice for a marker on a view that's already a
+      // whole rendered Earth.
       void this.loadLiveLayer('earthquakes', earthquakeGroup, fetchEarthquakes,
-        (d) => (d.location ? { lat: d.location.latitude, lon: d.location.longitude } : null), '\u{1F30D}', 0xff5500,
-        (d) => ({ title: `M${d.magnitude.toFixed(1)} — ${d.place}`, detail: `depth ${d.depthKm}km` }));
+        (d) => (d.location ? { lat: d.location.latitude, lon: d.location.longitude } : null), '〽', 0xff5500,
+        (d) => ({
+          title: `M${d.magnitude.toFixed(1)} — ${d.place}`,
+          lines: [
+            `Depth: ${d.depthKm}km`,
+            d.occurredAt ? `Time: ${new Date(d.occurredAt).toLocaleString()}` : '',
+            d.concernLevel ? `Concern: ${d.concernLevel}` : '',
+            d.nearTestSite ? `Near test site: ${d.testSiteName ?? 'yes'}` : '',
+          ].filter(Boolean),
+        }));
       void this.loadLiveLayer('gpsJamming', gpsJamGroup, async () => (await fetchGpsInterference())?.hexes ?? [],
         (d: GpsJamHex) => ({ lat: d.lat, lon: d.lon }), '\u{1F4E1}', 0xff00ff,
-        (d: GpsJamHex) => ({ title: `GPS jamming (${d.level})`, detail: `${d.pct.toFixed(1)}% of aircraft affected` }));
+        (d: GpsJamHex) => ({
+          title: `GPS jamming (${d.level})`,
+          lines: [`${d.pct.toFixed(1)}% of aircraft affected`, `${d.affectedAircraft} of ${d.totalAircraft} aircraft`],
+        }));
       void this.loadLiveLayer('radiationWatch', radiationGroup, async () => (await fetchRadiationWatch()).observations,
         (d: RadiationObservation) => ({ lat: d.lat, lon: d.lon }), '☢️', 0x00ff00,
-        (d: RadiationObservation) => ({ title: d.location, detail: `${d.value} ${d.unit}` }));
+        (d: RadiationObservation) => ({
+          title: d.location,
+          lines: [
+            d.country,
+            `${d.value.toFixed(1)} ${d.unit} (baseline ${d.baselineValue.toFixed(1)})`,
+            `Δ ${d.delta >= 0 ? '+' : ''}${d.delta.toFixed(1)} vs baseline`,
+            `${d.severity.toUpperCase()} · ${d.confidence} confidence`,
+            d.corroborated ? 'Corroborated by multiple sources' : '',
+            d.conflictingSources ? 'Conflicting sources' : '',
+          ].filter(Boolean),
+        }));
       void this.loadLiveLayer('conflicts', conflictGroup,
         async () => { const resp = await fetchUcdpEvents(); return resp.success ? resp.data : []; },
         (d) => ({ lat: d.latitude, lon: d.longitude }), '⚔️', 0xff3b3b,
-        (d) => ({ title: d.country, detail: `${d.deaths_best || 0} fatalities · ${d.date_start}` }));
+        (d) => ({
+          title: d.country,
+          lines: [
+            `${d.side_a} vs ${d.side_b}`,
+            `${d.deaths_best || 0} fatalities (${d.date_start})`,
+            d.type_of_violence ? `Type: ${d.type_of_violence}` : '',
+          ].filter(Boolean),
+        }));
     };
     refreshAll();
     this.refreshTimer = setInterval(refreshAll, LIVE_LAYER_REFRESH_INTERVAL_MS);
@@ -1025,8 +1113,7 @@ export class FlatEarthView {
       (ctx, toCanvas) => this.drawPaths(ctx, toCanvas, UNDERSEA_CABLES, 'rgba(255, 210, 60, 0.85)'));
     this.addOverlayLayer(scene, geometry, 'pipelines',
       (ctx, toCanvas) => this.drawPaths(ctx, toCanvas, PIPELINES, 'rgba(255, 120, 40, 0.85)'));
-    this.addOverlayLayer(scene, geometry, 'conflictZones',
-      (ctx, toCanvas) => this.drawConflictZones(ctx, toCanvas));
+    this.addConflictZonesLayer(scene, geometry);
 
     void this.loadSatellites(scene);
   }
@@ -1066,12 +1153,24 @@ export class FlatEarthView {
             const dotEl = this.buildSatelliteDotElement(color);
             dotEl.addEventListener('click', (e) => {
               const current = byNoradId.get(pos.noradId)?.latest;
-              if (current) {
-                this.showTooltip(e, {
-                  title: `${current.name} (${current.country})`,
-                  detail: `${current.type} · alt ${Math.round(current.alt)}km · ${current.velocity.toFixed(1)} km/s`,
-                });
-              }
+              if (!current) return;
+              // Same field set GlobeMap.ts's own satellite tooltip shows --
+              // this used to only surface type/alt/velocity.
+              const altBand = current.alt < 2000 ? 'LEO' : current.alt < 35786 ? 'MEO' : 'GEO';
+              const operatorName = SAT_OPERATOR_NAME[current.country] || getCountryNameByCode(current.country) || current.country;
+              const overHit = getCountryAtCoordinates(current.lat, current.lng);
+              this.showTooltip(e, {
+                title: `${current.name} (${current.country})`,
+                lines: [
+                  `NORAD ${current.noradId}`,
+                  `Type: ${SAT_TYPE_LABEL[current.type] ?? current.type}`,
+                  `Operator: ${operatorName}`,
+                  `Over: ${overHit ? overHit.name : 'Ocean'}`,
+                  `Alt. band: ${altBand} · ${Math.round(current.alt)} km`,
+                  `Incl.: ${current.inclination.toFixed(1)}°`,
+                  `Velocity: ${current.velocity.toFixed(1)} km/s`,
+                ],
+              });
             });
             const dot = new CSS2DObject(dotEl);
             group.add(dot);
@@ -1114,7 +1213,7 @@ export class FlatEarthView {
     scene: THREE.Scene, key: string, items: T[],
     getLatLon: (item: T) => { lat: number; lon: number },
     glyph: string, color: number,
-    getTooltip: (item: T) => { title: string; detail: string },
+    getTooltip: (item: T) => MarkerTooltipDatum,
   ): void {
     const group = this.makeLayerGroup(scene, key);
     this.addPointMarkers(group, items, getLatLon, glyph, color, getTooltip);
@@ -1131,7 +1230,7 @@ export class FlatEarthView {
     group: THREE.Group, items: T[],
     getLatLon: (item: T) => { lat: number; lon: number } | null,
     glyph: string, color: number,
-    getTooltip: (item: T) => { title: string; detail: string },
+    getTooltip: (item: T) => MarkerTooltipDatum,
   ): void {
     for (const item of items) {
       const ll = getLatLon(item);
@@ -1162,7 +1261,7 @@ export class FlatEarthView {
     key: string, group: THREE.Group, fetchFn: () => Promise<T[]>,
     getLatLon: (item: T) => { lat: number; lon: number } | null,
     glyph: string, color: number,
-    getTooltip: (item: T) => { title: string; detail: string },
+    getTooltip: (item: T) => MarkerTooltipDatum,
   ): Promise<void> {
     const render = (items: T[]): void => {
       this.clearGroupMarkers(group);
@@ -1187,15 +1286,20 @@ export class FlatEarthView {
   // Path/polygon layers get baked into their own small overlay texture
   // (same disc shape/UV as the day/night overlay) rather than individual
   // 3D line meshes -- simpler, and static data that never needs a redraw.
-  private addOverlayLayer(
-    scene: THREE.Scene, geometry: THREE.CircleGeometry, key: string,
+  // Factored out of addOverlayLayer so addConflictZonesLayer below can bake
+  // the same kind of canvas-texture overlay (for the shaded zone shapes)
+  // while ALSO adding real clickable markers into the same group -- plain
+  // addOverlayLayer only ever produces a non-interactive painted mesh.
+  private buildOverlayMesh(
+    geometry: THREE.CircleGeometry,
     draw: (ctx: CanvasRenderingContext2D, toCanvas: (local: { x: number; y: number }) => [number, number]) => void,
-  ): void {
+    yOffset: number,
+  ): THREE.Mesh | null {
     const canvas = document.createElement('canvas');
     canvas.width = TEXTURE_SIZE;
     canvas.height = TEXTURE_SIZE;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    if (!ctx) return null;
     const center = TEXTURE_SIZE / 2;
     const toCanvas = (local: { x: number; y: number }): [number, number] => [
       center + (local.x / DISC_RADIUS) * center,
@@ -1210,12 +1314,56 @@ export class FlatEarthView {
       new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false }),
     );
     mesh.rotation.x = -Math.PI / 2;
+    mesh.position.y = yOffset;
+    return mesh;
+  }
+
+  private addOverlayLayer(
+    scene: THREE.Scene, geometry: THREE.CircleGeometry, key: string,
+    draw: (ctx: CanvasRenderingContext2D, toCanvas: (local: { x: number; y: number }) => [number, number]) => void,
+  ): void {
     // Stacked just above the base disc/day-night overlay, each subsequent
     // one a hair higher to avoid z-fighting between overlays.
-    mesh.position.y = 0.1 + Object.keys(this.layerObjects).length * 0.01;
+    const mesh = this.buildOverlayMesh(geometry, draw, 0.1 + Object.keys(this.layerObjects).length * 0.01);
+    if (!mesh) return;
     mesh.visible = this.layers[key] !== false;
     scene.add(mesh);
     this.layerObjects[key] = mesh;
+  }
+
+  // Unlike the other polygon overlays (cables, pipelines are just painted
+  // onto the shared canvas texture, non-interactive), conflict zones also
+  // get a real clickable marker at each zone's center point -- same as
+  // GlobeMap.ts's own conflictZone markers -- so clicking one actually shows
+  // the zone's parties/casualties/history instead of nothing. Both the
+  // shaded-region texture and the markers live in one group so the layer
+  // toggle still governs both together.
+  private addConflictZonesLayer(scene: THREE.Scene, geometry: THREE.CircleGeometry): void {
+    const yOffset = 0.1 + Object.keys(this.layerObjects).length * 0.01;
+    const group = this.makeLayerGroup(scene, 'conflictZones');
+    const overlayMesh = this.buildOverlayMesh(geometry, (ctx, toCanvas) => this.drawConflictZones(ctx, toCanvas), yOffset);
+    if (overlayMesh) group.add(overlayMesh);
+
+    for (const zone of CONFLICT_ZONES) {
+      const color = zone.intensity === 'high' ? 0xff3030 : zone.intensity === 'medium' ? 0xff8800 : 0xffcc00;
+      const [lon, lat] = zone.center;
+      const world = localToWorld(projectLonLatLocal(lon, lat));
+      const el = this.buildMarkerElement('⚔️', color);
+      const lines = [
+        zone.location ?? '',
+        zone.parties?.length ? `Parties: ${zone.parties.join(', ')}` : '',
+        zone.casualties ? `Casualties: ${zone.casualties}` : '',
+        zone.displaced ? `Displaced: ${zone.displaced}` : '',
+        zone.startDate ? `Since: ${zone.startDate}` : '',
+        zone.totalFatalities ? `Total fatalities: ${zone.totalFatalities}` : '',
+        zone.peaceAgreements?.length ? `Peace agreements: ${zone.peaceAgreements.join(', ')}` : '',
+        zone.description ?? '',
+      ].filter((line): line is string => Boolean(line));
+      el.addEventListener('click', (e) => this.showTooltip(e, { title: zone.name, lines }));
+      const obj = new CSS2DObject(el);
+      obj.position.copy(world);
+      group.add(obj);
+    }
   }
 
   private drawPaths(
