@@ -900,15 +900,15 @@ export class FlatEarthView {
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(0, 0, 0);
-    // Was 0.3 -- far more conservative than the 3D globe (GlobeMap.ts's
-    // OrbitControls: minDistance 101 against a ~100-unit globe radius, i.e.
-    // ~1% of radius above the surface) allows. 0.08 brings the disc's
-    // relative zoom-in range much closer to that, though not all the way:
-    // past a certain point the baked disc texture (see TEXTURE_SIZE/
+    // Was 0.3, then 0.08 -- both far more conservative than the 3D globe
+    // (GlobeMap.ts's OrbitControls: minDistance 101 against a ~100-unit
+    // globe radius, i.e. ~1% of radius above the surface) allows. 0.02
+    // brings the disc's relative zoom-in range to that same ~1% ratio.
+    // Past a certain point the baked disc texture (see TEXTURE_SIZE/
     // NASA_TILE_ZOOM above) is still a fixed-resolution whole-globe bake,
     // not a real per-zoom tile LOD system like the globe has, so the very
     // closest zoom will read softer than the equivalent 3D globe zoom.
-    controls.minDistance = DISC_RADIUS * 0.08;
+    controls.minDistance = DISC_RADIUS * 0.02;
     controls.maxDistance = DISC_RADIUS * 3;
     // Stop just above the horizon -- keeps the camera from dipping below the
     // disc plane and looking at the underside of the whole scene.
