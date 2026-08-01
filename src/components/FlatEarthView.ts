@@ -77,7 +77,15 @@ const LOD_MAX_ZOOM = NASA_GIBS_MAX_LEVEL; // 8
 const LOD_ENGAGE_DISTANCE = DISC_RADIUS * 0.16; // 8 units -- below this, refine kicks in
 const LOD_SETTLE_DELAY_MS = 800; // mirrors GlobeMap.ts's controlsEndHandler debounce
 const LOD_MIN_REGION_SHIFT_DEG = 1.5; // lon/lat delta required before refetching at the same tier
-const LOD_TILE_FETCH_CAP = 256; // hard per-layer tile cap per refine
+// Was 256 (maxSide 16 -> a 4096x4096px patch canvas per layer, the exact
+// same footprint as each of the three already-resident base disc canvases
+// -- so a single refine could transiently allocate another ~200MB on top of
+// the ~200MB those three already use, before GPU texture memory or the rest
+// of the app's heap). 64 caps the patch canvas at 2048x2048px/layer
+// (~16MB, ~48MB across all three layers per refine) -- still generous for
+// what a genuinely regional LOD fetch needs, just no longer able to
+// approach the full-bake's own size.
+const LOD_TILE_FETCH_CAP = 64;
 
 // Doubling ladder: each halving of distance below LOD_ENGAGE_DISTANCE earns
 // one more tile-zoom level (8 -> 4 -> 2 -> 1 unit maps to zoom 5 -> 6 -> 7 ->
@@ -86,6 +94,22 @@ function lodZoomForDistance(distance: number): number {
   if (distance >= LOD_ENGAGE_DISTANCE) return LOD_BASE_ZOOM;
   const levels = Math.round(Math.log2(LOD_ENGAGE_DISTANCE / Math.max(distance, 0.01)));
   return Math.min(LOD_MAX_ZOOM, LOD_BASE_ZOOM + Math.max(0, levels));
+}
+
+// Touch-primary devices (phones/tablets) have a much tighter per-tab memory
+// budget than desktop, and this view's disc canvases are already
+// substantial even before LOD engages (three 4096x4096 base textures
+// resident at once -- see LOD_TILE_FETCH_CAP's comment for the actual
+// numbers). A crash was reported on mobile after this feature shipped;
+// rather than gamble on a tile budget that's "probably small enough" for an
+// unknown device, skip LOD entirely on touch-primary devices and keep the
+// existing fixed-resolution bake there. matchMedia('(pointer: coarse)') is
+// a reliable, well-supported signal for "this device's primary input is
+// touch" -- unlike navigator.deviceMemory, which iOS Safari (a real
+// candidate for the reported crash) doesn't implement at all.
+function isTouchPrimaryDevice(): boolean {
+  return typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    && window.matchMedia('(pointer: coarse)').matches;
 }
 
 // Every toggleable layer this view knows about -- static reference-data
@@ -1628,6 +1652,7 @@ export class FlatEarthView {
   // shading, day/night) -- see the "Zoom-based tile LOD" section near the
   // top of this file for the overall design.
   private async refineDiscLod(): Promise<void> {
+    if (isTouchPrimaryDevice()) return; // see isTouchPrimaryDevice's comment -- mobile crash safety net
     if (!this.camera || !this.discCanvas || !this.discTexture || !this.subsolar || !this.sublunar) return;
 
     const target = this.getDiscCameraTarget();
