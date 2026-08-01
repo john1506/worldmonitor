@@ -64,6 +64,30 @@ const MOON_DISTANCE = 150;
 const TWILIGHT_BAND_DEG = 6; // matches real civil-twilight convention
 const NIGHT_MAX_ALPHA = 0.72; // capped, not fully opaque -- imagery stays faintly visible at night
 
+// ─── Zoom-based tile LOD (Flat Earth disc) ─────────────────────────────────
+// The disc's base bake (see NASA_TILE_ZOOM/TEXTURE_SIZE above) is one
+// fixed-resolution texture for the whole globe -- unlike the 3D globe view,
+// which streams real per-zoom NASA tiles via three-globe's built-in tile
+// engine, zooming the disc's camera in just magnifies that fixed bake. This
+// section adds real LOD: as the camera settles closer than
+// LOD_ENGAGE_DISTANCE, fetch and composite higher-zoom NASA tiles for just
+// the visible region (see refineDiscLod).
+const LOD_BASE_ZOOM = Math.min(NASA_TILE_ZOOM, NASA_GIBS_MAX_LEVEL); // 5
+const LOD_MAX_ZOOM = NASA_GIBS_MAX_LEVEL; // 8
+const LOD_ENGAGE_DISTANCE = DISC_RADIUS * 0.16; // 8 units -- below this, refine kicks in
+const LOD_SETTLE_DELAY_MS = 800; // mirrors GlobeMap.ts's controlsEndHandler debounce
+const LOD_MIN_REGION_SHIFT_DEG = 1.5; // lon/lat delta required before refetching at the same tier
+const LOD_TILE_FETCH_CAP = 256; // hard per-layer tile cap per refine
+
+// Doubling ladder: each halving of distance below LOD_ENGAGE_DISTANCE earns
+// one more tile-zoom level (8 -> 4 -> 2 -> 1 unit maps to zoom 5 -> 6 -> 7 ->
+// 8, landing zoom LOD_MAX_ZOOM exactly at controls.minDistance).
+function lodZoomForDistance(distance: number): number {
+  if (distance >= LOD_ENGAGE_DISTANCE) return LOD_BASE_ZOOM;
+  const levels = Math.round(Math.log2(LOD_ENGAGE_DISTANCE / Math.max(distance, 0.01)));
+  return Math.min(LOD_MAX_ZOOM, LOD_BASE_ZOOM + Math.max(0, levels));
+}
+
 // Every toggleable layer this view knows about -- static reference-data
 // layers (always available, no fetch) plus a handful of live-fetched ones
 // (cached + periodically refreshed, see the caching section below).
@@ -90,6 +114,27 @@ function projectLonLatLocal(lon: number, lat: number): { x: number; y: number } 
   const lonRad = (lon * Math.PI) / 180;
   const rho = ((Math.PI / 2 - latRad) / Math.PI) * DISC_RADIUS;
   return { x: rho * Math.sin(lonRad), y: rho * Math.cos(lonRad) };
+}
+
+// Inverse of projectLonLatLocal. `radius` lets callers use either raw
+// local-space units (DISC_RADIUS) or texture-pixel units (TEXTURE_SIZE/2) --
+// both the LOD camera-viewport lookup and the per-pixel reprojection/patch
+// functions below need this identical rho/lonRad/latRad math, just at
+// different scales, so it's factored out once rather than hand-copied at
+// each call site.
+function localToLonLat(local: { x: number; y: number }, radius: number): { lonRad: number; latRad: number } | null {
+  const rho = Math.sqrt(local.x * local.x + local.y * local.y);
+  if (rho > radius) return null; // off the disc entirely
+  const lonRad = Math.atan2(local.x, local.y);
+  const latRad = Math.PI / 2 - (rho / radius) * Math.PI;
+  return { lonRad, latRad };
+}
+
+// Forward local-space -> texture-pixel helper, matching buildDisc's toCanvas
+// closure exactly (same formula, needed again by the LOD patch functions).
+function discLocalToTexturePixel(local: { x: number; y: number }, textureSize: number): [number, number] {
+  const center = textureSize / 2;
+  return [center + (local.x / DISC_RADIUS) * center, center + (local.y / DISC_RADIUS) * center];
 }
 
 // After disc.rotation.x = -PI/2, a local point (x, y, 0) lands at world
@@ -377,6 +422,64 @@ function buildWallFadeTexture(): THREE.CanvasTexture {
 // relay running on a Pi or its outbound connection pool.
 const TILE_FETCH_CONCURRENCY = 16;
 
+// Session-lifetime only (no TTL of its own -- the server's Cache-Control:
+// max-age=86400 already governs staleness, see imagery-relay.mjs's NASA
+// tile proxy+cache). Collapses duplicate in-flight requests for the exact
+// same tile URL (e.g. two overlapping LOD refines racing, or a patch
+// re-requesting a tile the whole-disc bake already has) and skips redundant
+// image-decode work. Bounded FIFO eviction so it can't grow unbounded across
+// a long session of continuous zooming.
+const tileImageCache = new Map<string, Promise<HTMLImageElement | null>>();
+const TILE_IMAGE_CACHE_MAX = 2048;
+
+function loadTileImageCached(url: string): Promise<HTMLImageElement | null> {
+  const hit = tileImageCache.get(url);
+  if (hit) return hit;
+  const promise = new Promise<HTMLImageElement | null>((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.referrerPolicy = 'no-referrer';
+    img.onload = () => resolve(img);
+    // A missing/failed tile just leaves that patch blank rather than
+    // failing the whole reprojection -- most of GIBS' grid resolves fine.
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+  tileImageCache.set(url, promise);
+  if (tileImageCache.size > TILE_IMAGE_CACHE_MAX) {
+    const oldest = tileImageCache.keys().next().value;
+    if (oldest) tileImageCache.delete(oldest);
+  }
+  return promise;
+}
+
+// Shared bounded-worker-pool tile loader used by both the whole-globe bake
+// (fetchAssembledMercatorCanvas) and the region-limited LOD patch fetch
+// (fetchAssembledMercatorPatch) below, so the concurrency-pool logic exists
+// in exactly one place. `coords` are tile (tx,ty) pairs at `zoom`; each tile
+// draws onto `ctx` at `((tx-originX)*tileSize, (ty-originY)*tileSize)`.
+async function loadTileGrid(
+  coords: [number, number][],
+  zoom: number,
+  tileUrlFn: (x: number, y: number, level: number) => string,
+  ctx: CanvasRenderingContext2D,
+  originX: number,
+  originY: number,
+  tileSize: number,
+): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(TILE_FETCH_CONCURRENCY, coords.length) }, async () => {
+    while (next < coords.length) {
+      const coord = coords[next++];
+      if (!coord) break;
+      const [tx, ty] = coord;
+      const img = await loadTileImageCached(tileUrlFn(tx, ty, zoom));
+      if (img) ctx.drawImage(img, (tx - originX) * tileSize, (ty - originY) * tileSize);
+    }
+  });
+  await Promise.all(workers);
+}
+
 async function fetchAssembledMercatorCanvas(
   zoom: number,
   tileUrlFn: (x: number, y: number, level: number) => string = nasaBlueMarbleTileUrl,
@@ -394,32 +497,41 @@ async function fetchAssembledMercatorCanvas(
     for (let ty = 0; ty < tilesPerSide; ty++) coords.push([tx, ty]);
   }
 
-  function loadTile(tx: number, ty: number, ctx: CanvasRenderingContext2D): Promise<void> {
-    const url = tileUrlFn(tx, ty, zoom);
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.referrerPolicy = 'no-referrer';
-      img.onload = () => { ctx.drawImage(img, tx * tileSize, ty * tileSize); resolve(); };
-      // A missing/failed tile just leaves that patch blank rather than
-      // failing the whole reprojection -- most of GIBS' grid resolves fine.
-      img.onerror = () => resolve();
-      img.src = url;
-    });
+  await loadTileGrid(coords, zoom, tileUrlFn, context, 0, 0, tileSize);
+  return canvas;
+}
+
+// Region-limited variant of fetchAssembledMercatorCanvas: fetches only the
+// explicit [txMin..txMax] x [tyMin..tyMax] tile window instead of the full
+// 2^zoom x 2^zoom grid -- used by the LOD refine path, which only ever needs
+// the tiles covering the currently-visible patch of the disc, not the whole
+// globe. Deliberately does NOT pre-fill the canvas background -- failed or
+// never-fetched tiles are left as the canvas's default transparent-black,
+// which the patch functions below use (alpha === 0) to distinguish "no data
+// here" from real imagery and skip those texels rather than overwriting
+// existing content.
+async function fetchAssembledMercatorPatch(
+  zoom: number,
+  txMin: number, txMax: number, tyMin: number, tyMax: number,
+  tileUrlFn: (x: number, y: number, level: number) => string,
+): Promise<{ canvas: HTMLCanvasElement; tileOriginX: number; tileOriginY: number } | null> {
+  const tileSize = 256;
+  const width = (txMax - txMin + 1) * tileSize;
+  const height = (tyMax - tyMin + 1) * tileSize;
+  if (width <= 0 || height <= 0) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const coords: [number, number][] = [];
+  for (let tx = txMin; tx <= txMax; tx++) {
+    for (let ty = tyMin; ty <= tyMax; ty++) coords.push([tx, ty]);
   }
 
-  const loads: Promise<void>[] = [];
-  let next = 0;
-  const workers = Array.from({ length: Math.min(TILE_FETCH_CONCURRENCY, coords.length) }, async () => {
-    while (next < coords.length) {
-      const coord = coords[next++];
-      if (!coord) break;
-      await loadTile(coord[0], coord[1], context);
-    }
-  });
-  loads.push(...workers);
-  await Promise.all(loads);
-  return canvas;
+  await loadTileGrid(coords, zoom, tileUrlFn, ctx, txMin, tyMin, tileSize);
+  return { canvas, tileOriginX: txMin, tileOriginY: tyMin };
 }
 
 // In-memory (module-level) cache of the raw assembled Mercator canvases
@@ -609,6 +721,68 @@ function reprojectMercatorToAzimuthal(source: HTMLCanvasElement, outSize: number
   return out;
 }
 
+// Region-limited counterpart to reprojectMercatorToAzimuthal, used by the
+// LOD refine path: mutates `existing` (a [pxMin,pyMin]..[pxMin+w,pyMin+h]
+// sub-rectangle of the full TEXTURE_SIZE x TEXTURE_SIZE texture, already
+// fetched via ctx.getImageData) in place, sampling from a freshly-fetched
+// higher-zoom `source` patch canvas (from fetchAssembledMercatorPatch)
+// instead of the whole-globe bake. Every skip path below leaves the
+// corresponding `existing` texel exactly as it was -- non-destructive by
+// construction, so a partially-covered or failed patch never overwrites
+// good existing imagery with garbage or black.
+function patchAzimuthalRegion(
+  existing: ImageData,
+  pxMin: number,
+  pyMin: number,
+  source: HTMLCanvasElement,
+  tileOriginX: number,
+  tileOriginY: number,
+  sourceZoom: number,
+  textureSize: number,
+): void {
+  const srcCtx = source.getContext('2d');
+  if (!srcCtx) return;
+  const srcData = srcCtx.getImageData(0, 0, source.width, source.height);
+  const center = textureSize / 2;
+  const maxLatRad = (MERCATOR_MAX_LAT * Math.PI) / 180;
+  const tileSize = 256;
+  const fullMercSize = 2 ** sourceZoom * tileSize;
+
+  for (let row = 0; row < existing.height; row++) {
+    for (let col = 0; col < existing.width; col++) {
+      const ox = pxMin + col;
+      const oy = pyMin + row;
+      const dx = ox - center;
+      const dy = oy - center;
+      const rho = Math.sqrt(dx * dx + dy * dy);
+      if (rho > center) continue; // outside the disc
+
+      const lonRad = Math.atan2(dx, dy);
+      const latRad = Math.PI / 2 - (rho / center) * Math.PI;
+      if (latRad > maxLatRad || latRad < -maxLatRad) continue; // no GIBS coverage at any zoom --
+                                                                 // leave the existing icy fill alone
+
+      // Same Mercator-pixel formula as sampleMercatorPixel, but against the
+      // full sourceZoom grid, then offset into the smaller fetched patch's
+      // local pixel space via tileOriginX/tileOriginY.
+      const mercX = ((lonRad + Math.PI) / (2 * Math.PI)) * fullMercSize - tileOriginX * tileSize;
+      const mercY = (0.5 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / (2 * Math.PI)) * fullMercSize - tileOriginY * tileSize;
+      const sx = Math.round(mercX);
+      const sy = Math.round(mercY);
+      if (sx < 0 || sy < 0 || sx >= source.width || sy >= source.height) continue; // outside the fetched patch
+
+      const sIdx = (sy * source.width + sx) * 4;
+      if (srcData.data[sIdx + 3] === 0) continue; // tile failed to load / never painted here
+
+      const dIdx = (row * existing.width + col) * 4;
+      existing.data[dIdx] = srcData.data[sIdx] ?? 0;
+      existing.data[dIdx + 1] = srcData.data[sIdx + 1] ?? 0;
+      existing.data[dIdx + 2] = srcData.data[sIdx + 2] ?? 0;
+      existing.data[dIdx + 3] = 255;
+    }
+  }
+}
+
 // A grayscale "how much to darken this point" multiplier, derived from real
 // terrain elevation via NASA GIBS' BlueMarble_ShadedRelief layer (Blue
 // Marble imagery pre-lit against actual elevation data -- visible mountain
@@ -626,26 +800,32 @@ function reprojectMercatorToAzimuthal(source: HTMLCanvasElement, outSize: number
 // differences, and keeping this a single overlay mesh (instead of adding a
 // second additive-blended one for the brightening half) matches how much
 // visual payoff this "just for fun" view needs for the complexity cost.
-function buildReliefShadingTexture(shadedReliefCanvas: HTMLCanvasElement | null, outSize: number): THREE.CanvasTexture {
+// BlueMarble_ShadedRelief's brightest features (snow, ice) consistently land
+// near this luminance across the whole global dataset -- pixels at or above
+// it multiply by 1 (no darkening); darker relief shading scales down from
+// there. Floored at RELIEF_MIN_FACTOR so deep-shadow/ocean areas don't
+// multiply the base imagery all the way to black. Shared (not local to
+// buildReliefShadingTexture) so patchReliefShadingRegion's LOD refine uses
+// the exact same formula rather than a hand-copied second version.
+const RELIEF_PEAK_LUMINANCE = 245;
+const RELIEF_MIN_FACTOR = 0.35;
+
+function buildReliefShadingTexture(
+  shadedReliefCanvas: HTMLCanvasElement | null,
+  outSize: number,
+): { texture: THREE.CanvasTexture; canvas: HTMLCanvasElement } {
   const canvas = document.createElement('canvas');
   canvas.width = outSize;
   canvas.height = outSize;
   const ctx = canvas.getContext('2d');
-  if (!ctx || !shadedReliefCanvas) return new THREE.CanvasTexture(canvas);
+  if (!ctx || !shadedReliefCanvas) return { texture: new THREE.CanvasTexture(canvas), canvas };
   const srcCtx = shadedReliefCanvas.getContext('2d');
-  if (!srcCtx) return new THREE.CanvasTexture(canvas);
+  if (!srcCtx) return { texture: new THREE.CanvasTexture(canvas), canvas };
   const srcData = srcCtx.getImageData(0, 0, shadedReliefCanvas.width, shadedReliefCanvas.height);
 
   const out = ctx.createImageData(outSize, outSize);
   const center = outSize / 2;
   const maxLatRad = (MERCATOR_MAX_LAT * Math.PI) / 180;
-  // BlueMarble_ShadedRelief's brightest features (snow, ice) consistently
-  // land near this luminance across the whole global dataset -- pixels at
-  // or above it multiply by 1 (no darkening); darker relief shading scales
-  // down from there. Floored at MIN_FACTOR so deep-shadow/ocean areas don't
-  // multiply the base imagery all the way to black.
-  const PEAK_LUMINANCE = 245;
-  const MIN_FACTOR = 0.35;
 
   for (let oy = 0; oy < outSize; oy++) {
     for (let ox = 0; ox < outSize; ox++) {
@@ -661,7 +841,7 @@ function buildReliefShadingTexture(shadedReliefCanvas: HTMLCanvasElement | null,
       if (latRad <= maxLatRad && latRad >= -maxLatRad) {
         const [r, g, b] = sampleMercatorPixel(srcData, lonRad, latRad);
         const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-        const factor = Math.max(MIN_FACTOR, Math.min(1, lum / PEAK_LUMINANCE));
+        const factor = Math.max(RELIEF_MIN_FACTOR, Math.min(1, lum / RELIEF_PEAK_LUMINANCE));
         pixelValue = Math.round(factor * 255);
       }
 
@@ -674,7 +854,173 @@ function buildReliefShadingTexture(shadedReliefCanvas: HTMLCanvasElement | null,
   ctx.putImageData(out, 0, 0);
   const texture = new THREE.CanvasTexture(canvas);
   texture.flipY = false; // matches the base disc's UV convention
-  return texture;
+  return { texture, canvas };
+}
+
+// Region-limited counterpart to buildReliefShadingTexture's per-pixel loop,
+// used by the LOD refine path -- same non-destructive skip-on-miss shape as
+// patchAzimuthalRegion (see its comment), just computing a luminance-factor
+// grayscale instead of copying RGB.
+function patchReliefShadingRegion(
+  existing: ImageData,
+  pxMin: number,
+  pyMin: number,
+  source: HTMLCanvasElement,
+  tileOriginX: number,
+  tileOriginY: number,
+  sourceZoom: number,
+  textureSize: number,
+): void {
+  const srcCtx = source.getContext('2d');
+  if (!srcCtx) return;
+  const srcData = srcCtx.getImageData(0, 0, source.width, source.height);
+  const center = textureSize / 2;
+  const maxLatRad = (MERCATOR_MAX_LAT * Math.PI) / 180;
+  const tileSize = 256;
+  const fullMercSize = 2 ** sourceZoom * tileSize;
+
+  for (let row = 0; row < existing.height; row++) {
+    for (let col = 0; col < existing.width; col++) {
+      const ox = pxMin + col;
+      const oy = pyMin + row;
+      const dx = ox - center;
+      const dy = oy - center;
+      const rho = Math.sqrt(dx * dx + dy * dy);
+      if (rho > center) continue;
+
+      const lonRad = Math.atan2(dx, dy);
+      const latRad = Math.PI / 2 - (rho / center) * Math.PI;
+      if (latRad > maxLatRad || latRad < -maxLatRad) continue; // leave the existing no-darkening fill
+
+      const mercX = ((lonRad + Math.PI) / (2 * Math.PI)) * fullMercSize - tileOriginX * tileSize;
+      const mercY = (0.5 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / (2 * Math.PI)) * fullMercSize - tileOriginY * tileSize;
+      const sx = Math.round(mercX);
+      const sy = Math.round(mercY);
+      if (sx < 0 || sy < 0 || sx >= source.width || sy >= source.height) continue;
+
+      const sIdx = (sy * source.width + sx) * 4;
+      if (srcData.data[sIdx + 3] === 0) continue;
+
+      const r = srcData.data[sIdx] ?? 0;
+      const g = srcData.data[sIdx + 1] ?? 0;
+      const b = srcData.data[sIdx + 2] ?? 0;
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      const factor = Math.max(RELIEF_MIN_FACTOR, Math.min(1, lum / RELIEF_PEAK_LUMINANCE));
+      const pixelValue = Math.round(factor * 255);
+
+      const dIdx = (row * existing.width + col) * 4;
+      existing.data[dIdx] = pixelValue;
+      existing.data[dIdx + 1] = pixelValue;
+      existing.data[dIdx + 2] = pixelValue;
+      existing.data[dIdx + 3] = 255;
+    }
+  }
+}
+
+// Region-limited counterpart to buildDayNightTexture's per-pixel loop, used
+// by the LOD refine path. Unlike patchAzimuthalRegion/patchReliefShadingRegion,
+// this does NOT skip-and-leave-existing when a source patch is missing --
+// the sun-elevation-based alpha is pure geometry/time, independent of any
+// imagery, so every non-off-disc pixel always gets a fresh alpha; only the
+// cityLights/moon-glint RGB *contribution* gracefully degrades to "none" if
+// its source patch is absent or didn't cover that pixel, mirroring
+// buildDayNightTexture's own existing null-data handling exactly.
+function patchDayNightRegion(
+  existing: ImageData,
+  pxMin: number,
+  pyMin: number,
+  blueMarblePatch: { canvas: HTMLCanvasElement; tileOriginX: number; tileOriginY: number } | null,
+  cityLightsPatch: { canvas: HTMLCanvasElement; tileOriginX: number; tileOriginY: number } | null,
+  sourceZoom: number,
+  textureSize: number,
+  subsolar: { lat: number; lon: number },
+  sublunar: { lat: number; lon: number },
+): void {
+  const center = textureSize / 2;
+  const sunLatRad = (subsolar.lat * Math.PI) / 180;
+  const sunLonRad = (subsolar.lon * Math.PI) / 180;
+  const moonLatRad = (sublunar.lat * Math.PI) / 180;
+  const moonLonRad = (sublunar.lon * Math.PI) / 180;
+  const tileSize = 256;
+  const fullMercSize = 2 ** sourceZoom * tileSize;
+
+  const blueMarbleData = blueMarblePatch?.canvas.getContext('2d')?.getImageData(0, 0, blueMarblePatch.canvas.width, blueMarblePatch.canvas.height) ?? null;
+  const cityLightsData = cityLightsPatch?.canvas.getContext('2d')?.getImageData(0, 0, cityLightsPatch.canvas.width, cityLightsPatch.canvas.height) ?? null;
+
+  // Windowed counterpart to sampleMercatorPixel: looks up a lon/lat inside
+  // one of the fetched patch canvases, offset by its own tileOriginX/Y into
+  // the full sourceZoom Mercator grid. Returns null (not a clamped nearest
+  // pixel) if the lon/lat falls outside the fetched patch or that tile never
+  // loaded (alpha === 0), so callers fall back to "no contribution" instead
+  // of sampling garbage/wrapped data from an unrelated part of the canvas.
+  function samplePatch(data: ImageData | null, originX: number, originY: number, lonRad: number, latRad: number): [number, number, number] | null {
+    if (!data) return null;
+    const mercX = ((lonRad + Math.PI) / (2 * Math.PI)) * fullMercSize - originX * tileSize;
+    const mercY = (0.5 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / (2 * Math.PI)) * fullMercSize - originY * tileSize;
+    const sx = Math.round(mercX);
+    const sy = Math.round(mercY);
+    if (sx < 0 || sy < 0 || sx >= data.width || sy >= data.height) return null;
+    const idx = (sy * data.width + sx) * 4;
+    if (data.data[idx + 3] === 0) return null;
+    return [data.data[idx] ?? 0, data.data[idx + 1] ?? 0, data.data[idx + 2] ?? 0];
+  }
+
+  for (let row = 0; row < existing.height; row++) {
+    for (let col = 0; col < existing.width; col++) {
+      const ox = pxMin + col;
+      const oy = pyMin + row;
+      const dx = ox - center;
+      const dy = oy - center;
+      const rho = Math.sqrt(dx * dx + dy * dy);
+      if (rho > center) continue; // outside the disc
+
+      const lonRad = Math.atan2(dx, dy);
+      const latRad = Math.PI / 2 - (rho / center) * Math.PI;
+
+      const sinElev = Math.sin(latRad) * Math.sin(sunLatRad)
+        + Math.cos(latRad) * Math.cos(sunLatRad) * Math.cos(lonRad - sunLonRad);
+      const elevDeg = (Math.asin(Math.max(-1, Math.min(1, sinElev))) * 180) / Math.PI;
+
+      let alpha: number;
+      let nightFactor: number;
+      if (elevDeg > TWILIGHT_BAND_DEG) { alpha = 0; nightFactor = 0; }
+      else if (elevDeg < -TWILIGHT_BAND_DEG) { alpha = NIGHT_MAX_ALPHA; nightFactor = 1; }
+      else { nightFactor = 1 - (elevDeg + TWILIGHT_BAND_DEG) / (2 * TWILIGHT_BAND_DEG); alpha = NIGHT_MAX_ALPHA * nightFactor; }
+
+      let r = 8, g = 12, b = 28;
+
+      if (nightFactor > 0) {
+        const cityLightsRgb = samplePatch(cityLightsData, cityLightsPatch?.tileOriginX ?? 0, cityLightsPatch?.tileOriginY ?? 0, lonRad, latRad);
+        if (cityLightsRgb) {
+          const [cr, cg, cb] = cityLightsRgb;
+          r += cr * nightFactor;
+          g += cg * 0.75 * nightFactor;
+          b += cb * 0.35 * nightFactor;
+        }
+
+        const blueMarbleRgb = samplePatch(blueMarbleData, blueMarblePatch?.tileOriginX ?? 0, blueMarblePatch?.tileOriginY ?? 0, lonRad, latRad);
+        if (blueMarbleRgb) {
+          const [br, bg, bb] = blueMarbleRgb;
+          const isOceanish = bb > br * 1.1 && bb > bg * 1.02 && br + bg + bb < 300;
+          if (isOceanish) {
+            const sinMoonElev = Math.sin(latRad) * Math.sin(moonLatRad)
+              + Math.cos(latRad) * Math.cos(moonLatRad) * Math.cos(lonRad - moonLonRad);
+            const moonElevDeg = (Math.asin(Math.max(-1, Math.min(1, sinMoonElev))) * 180) / Math.PI;
+            if (moonElevDeg > 0) {
+              const glint = Math.sin((moonElevDeg * Math.PI) / 180) * nightFactor * 55;
+              r += glint * 0.8; g += glint * 0.9; b += glint;
+            }
+          }
+        }
+      }
+
+      const dIdx = (row * existing.width + col) * 4;
+      existing.data[dIdx] = Math.min(255, r);
+      existing.data[dIdx + 1] = Math.min(255, g);
+      existing.data[dIdx + 2] = Math.min(255, b);
+      existing.data[dIdx + 3] = Math.round(alpha * 255);
+    }
+  }
 }
 
 // ─── Live-layer caching ─────────────────────────────────────────────────────
@@ -725,6 +1071,22 @@ export class FlatEarthView {
   private sunMoonGroup: THREE.Group | null = null;
   private dayNightMesh: THREE.Mesh | null = null;
   private reliefMesh: THREE.Mesh | null = null;
+  // Underlying canvases + textures for the three LOD-refinable layers, and
+  // the astronomy snapshot needed to re-run the day/night patch algorithm
+  // later -- all captured once in initScene, since refineDiscLod runs long
+  // after initScene's own local params/variables are out of scope. See the
+  // "Zoom-based tile LOD" section near the top of this file.
+  private discTexture: THREE.CanvasTexture | null = null;
+  private discCanvas: HTMLCanvasElement | null = null;
+  private reliefTexture: THREE.CanvasTexture | null = null;
+  private reliefCanvas: HTMLCanvasElement | null = null;
+  private dayNightTexture: THREE.CanvasTexture | null = null;
+  private dayNightCanvas: HTMLCanvasElement | null = null;
+  private subsolar: { lat: number; lon: number } | null = null;
+  private sublunar: { lat: number; lon: number } | null = null;
+  private lodFetchTimer: ReturnType<typeof setTimeout> | null = null;
+  private lodFetchVersion = 0;
+  private lastLodRegion: { lonRad: number; latRad: number; zoom: number } | null = null;
   // Every toggleable layer's Object3D, keyed the same as `layers` below --
   // lets setLayerEnabled() stay a one-line generic toggle instead of a long
   // if-chain as more layers get added.
@@ -807,6 +1169,12 @@ export class FlatEarthView {
     if (this.refreshTimer != null) clearInterval(this.refreshTimer);
     this.satelliteStopFn?.();
     this.resizeObserver?.disconnect();
+    if (this.lodFetchTimer != null) { clearTimeout(this.lodFetchTimer); this.lodFetchTimer = null; }
+    this.lodFetchVersion++; // orphan any in-flight refineDiscLod so its result is discarded on resolve
+    // OrbitControls.dispose() only removes its own internal pointer/wheel DOM
+    // listeners, not custom 'end' listeners callers registered on its
+    // EventDispatcher -- must remove this explicitly first.
+    this.controls?.removeEventListener('end', this.handleControlsEnd);
     this.controls?.dispose();
     this.scene?.traverse((obj) => {
       // Mesh covers most of the scene; LineSegments (the satellite beam
@@ -844,6 +1212,15 @@ export class FlatEarthView {
     this.sunMoonGroup = null;
     this.dayNightMesh = null;
     this.reliefMesh = null;
+    this.discTexture = null;
+    this.discCanvas = null;
+    this.reliefTexture = null;
+    this.reliefCanvas = null;
+    this.dayNightTexture = null;
+    this.dayNightCanvas = null;
+    this.subsolar = null;
+    this.sublunar = null;
+    this.lastLodRegion = null;
     this.layerObjects = {};
     this.refreshTimer = null;
     this.satelliteStopFn = null;
@@ -859,6 +1236,11 @@ export class FlatEarthView {
   ): Promise<void> {
     const width = Math.max(1, viewport.clientWidth);
     const height = Math.max(1, viewport.clientHeight);
+
+    // Needed later by refineDiscLod/patchDayNightRegion, long after this
+    // function's own local params are out of scope.
+    this.subsolar = subsolar;
+    this.sublunar = sublunar;
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x030507);
@@ -916,6 +1298,9 @@ export class FlatEarthView {
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
     controls.update();
+    // Zoom-based tile LOD: fires (debounced) whenever the user stops
+    // dragging/scrolling, not on every frame -- see refineDiscLod.
+    controls.addEventListener('end', this.handleControlsEnd);
 
     scene.add(new THREE.AmbientLight(0x8899bb, 0.85));
     const sunPos = skyPosition(subsolar.lat, subsolar.lon, SUN_DISTANCE);
@@ -930,10 +1315,11 @@ export class FlatEarthView {
     // Cached in memory across open/close cycles (see getCachedTileImagery) --
     // reused for the base disc texture, the day/night overlay's city-lights/
     // ocean-glint blending, and the relief-shading overlay below.
-    const tileZoom = Math.min(NASA_TILE_ZOOM, NASA_GIBS_MAX_LEVEL);
-    const { blueMarble: blueMarbleCanvas, cityLights: cityLightsCanvas, shadedRelief: shadedReliefCanvas } = await getCachedTileImagery(tileZoom);
+    const { blueMarble: blueMarbleCanvas, cityLights: cityLightsCanvas, shadedRelief: shadedReliefCanvas } = await getCachedTileImagery(LOD_BASE_ZOOM);
 
-    const { texture, geometry } = await this.buildDisc(blueMarbleCanvas);
+    const { texture, geometry, canvas: discCanvas } = await this.buildDisc(blueMarbleCanvas);
+    this.discTexture = texture;
+    this.discCanvas = discCanvas;
     // Unlit (MeshBasicMaterial), not MeshStandardMaterial: the dedicated
     // dayNightMesh overlay right below already does the actual day/night
     // shading against real sun position, so a standard material's own
@@ -954,7 +1340,7 @@ export class FlatEarthView {
     // uniformly flat. Sits just above the base disc and below the day/night
     // overlay -- see buildReliefShadingTexture for why this is multiply-only
     // (darkening, not brightening) and toggleable independently.
-    const reliefTexture = buildReliefShadingTexture(shadedReliefCanvas, TEXTURE_SIZE);
+    const { texture: reliefTexture, canvas: reliefCanvas } = buildReliefShadingTexture(shadedReliefCanvas, TEXTURE_SIZE);
     const reliefMesh = new THREE.Mesh(
       geometry.clone(),
       // premultipliedAlpha: true -- without it, three.js's WebGLState hits an
@@ -971,6 +1357,8 @@ export class FlatEarthView {
     reliefMesh.visible = this.layers.reliefShading !== false;
     scene.add(reliefMesh);
     this.reliefMesh = reliefMesh;
+    this.reliefTexture = reliefTexture;
+    this.reliefCanvas = reliefCanvas;
 
     const sunMoonGroup = new THREE.Group();
     sunMoonGroup.visible = this.layers.sunMoon !== false;
@@ -1043,7 +1431,7 @@ export class FlatEarthView {
     // day/night maps). A separate, toggleable layer rather than baked into
     // the base imagery texture, so it can be regenerated/toggled cheaply
     // without re-fetching or re-reprojecting the NASA tiles.
-    const dayNightTexture = this.buildDayNightTexture(subsolar, sublunar, blueMarbleCanvas, cityLightsCanvas);
+    const { texture: dayNightTexture, canvas: dayNightCanvas } = this.buildDayNightTexture(subsolar, sublunar, blueMarbleCanvas, cityLightsCanvas);
     const dayNightMesh = new THREE.Mesh(
       geometry.clone(), // same UV-overridden shape, no need to redo that per-vertex loop
       new THREE.MeshBasicMaterial({ map: dayNightTexture, transparent: true, depthWrite: false, fog: false }),
@@ -1053,6 +1441,8 @@ export class FlatEarthView {
     dayNightMesh.visible = this.layers.dayNight !== false;
     scene.add(dayNightMesh);
     this.dayNightMesh = dayNightMesh;
+    this.dayNightTexture = dayNightTexture;
+    this.dayNightCanvas = dayNightCanvas;
 
     // The ice wall -- rises right at the disc's outer rim, exactly where the
     // texture's Antarctica ring (and the polar-fill from Mercator's own
@@ -1196,6 +1586,180 @@ export class FlatEarthView {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height);
     this.labelRenderer?.setSize(width, height);
+  }
+
+  // Where the camera is actually looking, on the disc. Deliberately does NOT
+  // use controls.target -- default OrbitControls panning (live, unmodified
+  // in this file) moves .target freely and can drift it off the y=0 disc
+  // plane over repeated oblique pans, so it can't be trusted as "the point
+  // the camera is centered on". Instead: an analytic ray/plane intersection
+  // from the camera through the screen-center view direction against the
+  // disc's world-space y=0 plane -- cheap, and correct regardless of pan
+  // drift.
+  private getDiscCameraTarget(): { local: { x: number; y: number }; distance: number } | null {
+    if (!this.camera) return null;
+    const origin = this.camera.position;
+    const dir = new THREE.Vector3();
+    this.camera.getWorldDirection(dir);
+    if (Math.abs(dir.y) < 1e-6) return null; // view direction ~parallel to the disc plane
+    const t = -origin.y / dir.y;
+    if (t <= 0) return null; // disc plane is behind the camera
+    const hit = origin.clone().addScaledVector(dir, t);
+    // Inverse of localToWorld's rotation note (see the comment above
+    // localToWorld near the top of this file): world (x, 0, z) -> local
+    // (x, y) is local.x = world.x, local.y = -world.z.
+    return { local: { x: hit.x, y: -hit.z }, distance: origin.distanceTo(hit) };
+  }
+
+  // Debounced trigger for refineDiscLod -- fires ~LOD_SETTLE_DELAY_MS after
+  // the user stops dragging/scrolling (OrbitControls' 'end' event), not on
+  // every frame. Bound arrow-function class property (matches this file's
+  // own handleKeydown convention) so add/removeEventListener see the same
+  // reference both times.
+  private handleControlsEnd = (): void => {
+    if (this.lodFetchTimer != null) clearTimeout(this.lodFetchTimer);
+    this.lodFetchTimer = setTimeout(() => { void this.refineDiscLod(); }, LOD_SETTLE_DELAY_MS);
+  };
+
+  // Core LOD orchestration: figure out whether the camera has settled
+  // somewhere that warrants higher-res imagery than the base bake, fetch
+  // just the tiles needed for that region at the appropriate zoom, and
+  // composite them into all three disc layers (base imagery, relief
+  // shading, day/night) -- see the "Zoom-based tile LOD" section near the
+  // top of this file for the overall design.
+  private async refineDiscLod(): Promise<void> {
+    if (!this.camera || !this.discCanvas || !this.discTexture || !this.subsolar || !this.sublunar) return;
+
+    const target = this.getDiscCameraTarget();
+    if (!target || target.distance >= LOD_ENGAGE_DISTANCE) return;
+
+    const zoom = lodZoomForDistance(target.distance);
+    if (zoom <= LOD_BASE_ZOOM) return;
+
+    const geo = localToLonLat(target.local, DISC_RADIUS);
+    if (!geo) return; // panned past the disc edge
+
+    const maxLatRad = (MERCATOR_MAX_LAT * Math.PI) / 180;
+    if (Math.abs(geo.latRad) > maxLatRad) return; // inside the unmapped polar cap --
+                                                    // nothing GIBS can provide at any zoom here
+
+    if (this.lastLodRegion && this.lastLodRegion.zoom === zoom) {
+      const dLon = Math.abs(geo.lonRad - this.lastLodRegion.lonRad) * (180 / Math.PI);
+      const dLat = Math.abs(geo.latRad - this.lastLodRegion.latRad) * (180 / Math.PI);
+      if (dLon < LOD_MIN_REGION_SHIFT_DEG && dLat < LOD_MIN_REGION_SHIFT_DEG) return;
+    }
+
+    // Loose over-fetch radius (1.4x margin) instead of an exact
+    // frustum-corner intersection, which can extend absurdly far or fail to
+    // intersect at all once maxPolarAngle allows near-horizon grazing
+    // angles -- LOD_ENGAGE_DISTANCE's own bail-out above already self-limits
+    // any pathological grazing-angle hit distance, so no separate cap is
+    // needed here.
+    const halfFovRad = (this.camera.fov * Math.PI / 180) / 2;
+    const footprintRadiusLocal = Math.min(DISC_RADIUS, Math.max(0.5, target.distance * Math.tan(halfFovRad) * 1.4));
+
+    // Geographic tile-range bbox: sample 8 points around the footprint
+    // circle (plus the center) rather than just the local-space bounding
+    // square's corners -- the azimuthal projection is nonlinear, so this
+    // gives a tighter, more accurate tile range for a genuinely circular
+    // visible footprint. Points that land off the disc (rho > DISC_RADIUS)
+    // are simply skipped; the center point itself is always included as a
+    // guaranteed-valid fallback.
+    const tilesPerSide = 2 ** zoom;
+    let txMin = Infinity, txMax = -Infinity, tyMin = Infinity, tyMax = -Infinity;
+    const includeSample = (lonRad: number, latRad: number): void => {
+      const clampedLat = Math.max(-maxLatRad, Math.min(maxLatRad, latRad));
+      const mercX = ((lonRad + Math.PI) / (2 * Math.PI)) * tilesPerSide;
+      const mercY = (0.5 - Math.log(Math.tan(Math.PI / 4 + clampedLat / 2)) / (2 * Math.PI)) * tilesPerSide;
+      const tx = Math.max(0, Math.min(tilesPerSide - 1, Math.floor(mercX)));
+      const ty = Math.max(0, Math.min(tilesPerSide - 1, Math.floor(mercY)));
+      txMin = Math.min(txMin, tx); txMax = Math.max(txMax, tx);
+      tyMin = Math.min(tyMin, ty); tyMax = Math.max(tyMax, ty);
+    };
+    includeSample(geo.lonRad, geo.latRad);
+    for (let i = 0; i < 8; i++) {
+      const angle = (i / 8) * Math.PI * 2;
+      const sampleLocal = {
+        x: target.local.x + Math.cos(angle) * footprintRadiusLocal,
+        y: target.local.y + Math.sin(angle) * footprintRadiusLocal,
+      };
+      const sampleGeo = localToLonLat(sampleLocal, DISC_RADIUS);
+      if (sampleGeo) includeSample(sampleGeo.lonRad, sampleGeo.latRad);
+    }
+
+    // Hard per-layer tile cap, independent of how wide the sampled bbox
+    // came out (e.g. an oblique/grazing framing) -- clamp to a maxSide x
+    // maxSide window centered on the target's own tile, rather than growing
+    // unbounded.
+    const maxSide = Math.floor(Math.sqrt(LOD_TILE_FETCH_CAP));
+    const centerTx = Math.max(0, Math.min(tilesPerSide - 1, Math.floor(((geo.lonRad + Math.PI) / (2 * Math.PI)) * tilesPerSide)));
+    const centerTy = Math.max(0, Math.min(tilesPerSide - 1,
+      Math.floor((0.5 - Math.log(Math.tan(Math.PI / 4 + geo.latRad / 2)) / (2 * Math.PI)) * tilesPerSide)));
+    if (txMax - txMin + 1 > maxSide) { txMin = Math.max(0, centerTx - Math.floor(maxSide / 2)); txMax = Math.min(tilesPerSide - 1, txMin + maxSide - 1); }
+    if (tyMax - tyMin + 1 > maxSide) { tyMin = Math.max(0, centerTy - Math.floor(maxSide / 2)); tyMax = Math.min(tilesPerSide - 1, tyMin + maxSide - 1); }
+
+    const version = ++this.lodFetchVersion;
+    const [blueMarblePatch, cityLightsPatch, shadedReliefPatch] = await Promise.all([
+      fetchAssembledMercatorPatch(zoom, txMin, txMax, tyMin, tyMax, nasaBlueMarbleTileUrl).catch((err) => {
+        console.warn('[FlatEarthView] LOD patch fetch failed for blueMarble', err);
+        return null;
+      }),
+      fetchAssembledMercatorPatch(zoom, txMin, txMax, tyMin, tyMax, nasaCityLightsTileUrl).catch((err) => {
+        console.warn('[FlatEarthView] LOD patch fetch failed for cityLights', err);
+        return null;
+      }),
+      fetchAssembledMercatorPatch(zoom, txMin, txMax, tyMin, tyMax, nasaShadedReliefTileUrl).catch((err) => {
+        console.warn('[FlatEarthView] LOD patch fetch failed for shadedRelief', err);
+        return null;
+      }),
+    ]);
+    if (version !== this.lodFetchVersion) return; // superseded by a newer refine -- discard
+
+    // Bounding rect in texture-pixel space, from the same local-space
+    // footprint square used above (expanded 10% further for safety margin),
+    // clamped to the texture's own bounds.
+    const [cx1, cy1] = discLocalToTexturePixel(
+      { x: target.local.x - footprintRadiusLocal * 1.1, y: target.local.y - footprintRadiusLocal * 1.1 }, TEXTURE_SIZE);
+    const [cx2, cy2] = discLocalToTexturePixel(
+      { x: target.local.x + footprintRadiusLocal * 1.1, y: target.local.y + footprintRadiusLocal * 1.1 }, TEXTURE_SIZE);
+    const pxMin = Math.max(0, Math.floor(Math.min(cx1, cx2)));
+    const pxMax = Math.min(TEXTURE_SIZE - 1, Math.ceil(Math.max(cx1, cx2)));
+    const pyMin = Math.max(0, Math.floor(Math.min(cy1, cy2)));
+    const pyMax = Math.min(TEXTURE_SIZE - 1, Math.ceil(Math.max(cy1, cy2)));
+    const w = pxMax - pxMin;
+    const h = pyMax - pyMin;
+    if (w <= 0 || h <= 0) return;
+
+    if (blueMarblePatch && this.discCanvas && this.discTexture) {
+      const ctx = this.discCanvas.getContext('2d');
+      if (ctx) {
+        const existing = ctx.getImageData(pxMin, pyMin, w, h);
+        patchAzimuthalRegion(existing, pxMin, pyMin, blueMarblePatch.canvas, blueMarblePatch.tileOriginX, blueMarblePatch.tileOriginY, zoom, TEXTURE_SIZE);
+        ctx.putImageData(existing, pxMin, pyMin);
+        await this.drawDiscOverlays(ctx, TEXTURE_SIZE); // unconditional full redraw -- cheap, see its own comment
+        this.discTexture.needsUpdate = true;
+      }
+    }
+    if (shadedReliefPatch && this.reliefCanvas && this.reliefTexture) {
+      const ctx = this.reliefCanvas.getContext('2d');
+      if (ctx) {
+        const existing = ctx.getImageData(pxMin, pyMin, w, h);
+        patchReliefShadingRegion(existing, pxMin, pyMin, shadedReliefPatch.canvas, shadedReliefPatch.tileOriginX, shadedReliefPatch.tileOriginY, zoom, TEXTURE_SIZE);
+        ctx.putImageData(existing, pxMin, pyMin);
+        this.reliefTexture.needsUpdate = true;
+      }
+    }
+    if (this.dayNightCanvas && this.dayNightTexture && (blueMarblePatch || cityLightsPatch)) {
+      const ctx = this.dayNightCanvas.getContext('2d');
+      if (ctx) {
+        const existing = ctx.getImageData(pxMin, pyMin, w, h);
+        patchDayNightRegion(existing, pxMin, pyMin, blueMarblePatch, cityLightsPatch, zoom, TEXTURE_SIZE, this.subsolar, this.sublunar);
+        ctx.putImageData(existing, pxMin, pyMin);
+        this.dayNightTexture.needsUpdate = true;
+      }
+    }
+
+    this.lastLodRegion = { lonRad: geo.lonRad, latRad: geo.latRad, zoom };
   }
 
   // Shown/positioned from a marker element's own click listener now,
@@ -1699,12 +2263,12 @@ export class FlatEarthView {
     sublunar: { lat: number; lon: number },
     blueMarbleCanvas: HTMLCanvasElement | null,
     cityLightsCanvas: HTMLCanvasElement | null,
-  ): THREE.CanvasTexture {
+  ): { texture: THREE.CanvasTexture; canvas: HTMLCanvasElement } {
     const canvas = document.createElement('canvas');
     canvas.width = TEXTURE_SIZE;
     canvas.height = TEXTURE_SIZE;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return new THREE.CanvasTexture(canvas);
+    if (!ctx) return { texture: new THREE.CanvasTexture(canvas), canvas };
 
     const imageData = ctx.createImageData(TEXTURE_SIZE, TEXTURE_SIZE);
     const center = TEXTURE_SIZE / 2;
@@ -1773,10 +2337,10 @@ export class FlatEarthView {
     ctx.putImageData(imageData, 0, 0);
     const texture = new THREE.CanvasTexture(canvas);
     texture.flipY = false; // matches the base disc's UV convention
-    return texture;
+    return { texture, canvas };
   }
 
-  private async buildDisc(blueMarbleCanvas: HTMLCanvasElement | null): Promise<{ texture: THREE.CanvasTexture; geometry: THREE.CircleGeometry }> {
+  private async buildDisc(blueMarbleCanvas: HTMLCanvasElement | null): Promise<{ texture: THREE.CanvasTexture; geometry: THREE.CircleGeometry; canvas: HTMLCanvasElement }> {
     const geometry = new THREE.CircleGeometry(DISC_RADIUS, 128);
 
     // Override the geometry's UVs from its own real vertex data using the
@@ -1786,7 +2350,10 @@ export class FlatEarthView {
     // and everything else lands, by construction.
     const posAttr = geometry.attributes.position;
     const uv = geometry.attributes.uv;
-    if (!posAttr || !uv) return { texture: new THREE.CanvasTexture(document.createElement('canvas')), geometry };
+    if (!posAttr || !uv) {
+      const emptyCanvas = document.createElement('canvas');
+      return { texture: new THREE.CanvasTexture(emptyCanvas), geometry, canvas: emptyCanvas };
+    }
     for (let i = 0; i < posAttr.count; i++) {
       const vx = posAttr.getX(i);
       const vy = posAttr.getY(i);
@@ -1798,20 +2365,10 @@ export class FlatEarthView {
     canvas.width = TEXTURE_SIZE;
     canvas.height = TEXTURE_SIZE;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return { texture: new THREE.CanvasTexture(canvas), geometry };
+    if (!ctx) return { texture: new THREE.CanvasTexture(canvas), geometry, canvas };
 
     ctx.fillStyle = '#050a12';
     ctx.fillRect(0, 0, TEXTURE_SIZE, TEXTURE_SIZE);
-
-    const center = TEXTURE_SIZE / 2;
-
-    // Maps geometry-local (x,y) -> canvas pixel, matching the UV override
-    // above exactly (no v-flip needed since the texture below has flipY
-    // explicitly disabled -- see the end of this function).
-    const toCanvas = (local: { x: number; y: number }): [number, number] => [
-      center + (local.x / DISC_RADIUS) * center,
-      center + (local.y / DISC_RADIUS) * center,
-    ];
 
     if (blueMarbleCanvas) {
       try {
@@ -1821,6 +2378,30 @@ export class FlatEarthView {
         console.warn('[FlatEarthView] failed to reproject NASA imagery, falling back to a plain background', err);
       }
     }
+
+    await this.drawDiscOverlays(ctx, TEXTURE_SIZE);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    // Disabling the default vertical flip removes any ambiguity about which
+    // direction is "up" in the mapping between canvas pixels and UV space --
+    // the toCanvas()/UV-override formulas above both assume this.
+    texture.flipY = false;
+    return { texture, geometry, canvas };
+  }
+
+  // Lat rings, country borders, and the north-pole marker dot -- drawn ON
+  // TOP of the base imagery in the same 2D context. Extracted out of
+  // buildDisc so refineDiscLod's LOD patches can redraw exactly this same
+  // overlay pass after patching a sub-region of the canvas: ctx.putImageData
+  // is a hard overwrite with no blending, so a patch that didn't redraw
+  // these afterward would silently erase whatever border/ring strokes fall
+  // in the patched area. Cheap enough (countries.geojson is ~7.3k line-
+  // segment points total) to redraw unconditionally rather than clip to the
+  // patched region.
+  private async drawDiscOverlays(ctx: CanvasRenderingContext2D, textureSize: number): Promise<void> {
+    const center = textureSize / 2;
+    const toCanvas = (local: { x: number; y: number }): [number, number] => discLocalToTexturePixel(local, textureSize);
 
     ctx.strokeStyle = 'rgba(140, 200, 255, 0.25)';
     ctx.lineWidth = 1;
@@ -1864,13 +2445,5 @@ export class FlatEarthView {
     ctx.beginPath();
     ctx.arc(nx, ny, 3, 0, Math.PI * 2);
     ctx.fill();
-
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    // Disabling the default vertical flip removes any ambiguity about which
-    // direction is "up" in the mapping between canvas pixels and UV space --
-    // the toCanvas()/UV-override formulas above both assume this.
-    texture.flipY = false;
-    return { texture, geometry };
   }
 }
